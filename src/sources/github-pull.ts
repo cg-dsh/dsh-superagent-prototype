@@ -5,6 +5,8 @@ import type { Deployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
+import { moveIssuesToStatus } from './github-projects.ts'
+import type { GithubConfig } from './github.ts'
 
 const PullSchema = z.looseObject({
   title: z.string().optional(), state: z.string(), html_url: z.string(), user: UserSchema,
@@ -56,7 +58,7 @@ export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): strin
  */
 export async function observePull(ctx: SourceContext, pr: Pull): Promise<boolean> {
   const ended = pr.state === 'closed' || !!pr.merged
-  if (ended) closePull(ctx, pr)
+  if (ended) await closePull(ctx, pr)
   else {
     const candidates = agentPull(pr, ctx.deployment) ? ctx.tickets.open().filter(ticket => ticketBranch(ticket, pr.head.ref)) : []
     const ticket = candidates.length === 1 ? candidates[0]! : undefined
@@ -77,10 +79,32 @@ function bind(ctx: SourceContext, ticketId: string, pr: Pull, own: boolean): voi
  * Reports a merged or closed PR once to the open tickets that follow it, whose end the core decides.
  * Their subscription to the PR stays so a later human comment there resumes the ticket.
  */
-function closePull(ctx: SourceContext, pr: Pull): void {
-  if (!ctx.tickets.open().some(ticket => pullsOf(ticket, true).includes(pr.number))) return
+async function closePull(ctx: SourceContext, pr: Pull): Promise<void> {
+  const followers = ctx.tickets.open().filter(ticket => pullsOf(ticket, true).includes(pr.number))
+  if (!followers.length) return
   const at = pr.merged_at ?? pr.closed_at ?? new Date().toISOString()
+  const issues = [...new Set(followers.flatMap(ticket => (ticket.channels ?? [])
+    .filter(channel => channel.source === SOURCE && !(channel.address.url ?? '').includes('/pull/'))
+    .map(channel => Number(channel.address.number))
+    .filter(number => Number.isFinite(number) && number > 0)))]
   ctx.tickets.threadClosed({ source: SOURCE, id: String(pr.number) }, pr.merged ? 'merged' : 'closed', at)
+  // A merge starts no Executor turn, so the board move is done here rather than by prompt text.
+  if (pr.merged) await moveToStatus(ctx, pr, issues)
+}
+
+/** Moves the merged PR's Issues to the configured test column and records the result on the PR's Thread. */
+async function moveToStatus(ctx: SourceContext, pr: Pull, issues: readonly number[]): Promise<void> {
+  const hint = (ctx.config<GithubConfig>(SOURCE)?.projectStatus ?? '').trim()
+  if (!issues.length || !hint) return
+  const fact = (value: string, problem = false): ThreadFact => ({
+    label: { zh: '项目状态', en: 'Project status' }, value, ...problem ? { problem: true as const } : {},
+  })
+  try {
+    const move = await moveIssuesToStatus(ctx.commands, ctx.deployment.repository, issues, hint)
+    if (move.lines.length) ctx.threads.describe(`github:${pr.number}`, { facts: { projectStatus: fact(move.lines.join('; '), !move.ok) } })
+  } catch (error) {
+    ctx.threads.describe(`github:${pr.number}`, { facts: { projectStatus: fact(`failed: ${error instanceof Error ? error.message : String(error)}`, true) } })
+  }
 }
 /**
  * Builds idempotent outbound notices for IM conversations when a ticket ends with its PR (selecting the last-closed PR it

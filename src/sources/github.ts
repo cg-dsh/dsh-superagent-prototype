@@ -24,6 +24,7 @@ const NotificationSchema = z.looseObject({
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
+  projectStatus: z.string().trim().max(40).default('test'),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
   observeCi: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
@@ -54,7 +55,9 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
-      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
+      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'projectStatus', type: 'text', advanced: true, label: { zh: '合并后移动到的项目状态', en: 'Project column after a merge' },
+      hint: { zh: 'PR 合并后，把它的 Issue 移动到这个名称最接近的项目列；留空则不移动。按项目实际提供的列表选择，不会选择“已完成”“通过”一类的列。', en: 'After a PR merges, move its Issues to the project column whose name best matches this; empty disables it. The column is chosen from what each project offers, and a finished or passed column is never chosen.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
