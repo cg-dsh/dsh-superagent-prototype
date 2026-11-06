@@ -153,6 +153,11 @@ const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOSt
   failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
+/** Slack added to every notified read:
+ * GitHub indexes a notification seconds to a minute after the comment it is for,
+ * so reading strictly from the polling cursor drops a comment created just before
+ * it. The window re-reads that few minutes; Trigger ids make a repeated read harmless. */
+const NOTIFICATION_LAG_MS = 10 * 60 * 1000
 const RETRY_WINDOW_MS = 24 * 3600_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
@@ -383,17 +388,19 @@ function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
 }
 async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
+  // Read from before the cursor: a notification can arrive after the comment it announces.
+  const from = new Date(Date.parse(since) - NOTIFICATION_LAG_MS).toISOString()
   const { login } = ctx.deployment.github
   const kinds = ref.isPr ? ['conversation', 'inline', 'review'] as const : ['conversation'] as const
   for (const kind of kinds) {
-    const suffix = `&since=${encodeURIComponent(since)}`
+    const suffix = `&since=${encodeURIComponent(from)}`
     const path = kind === 'conversation' ? `issues/${ref.number}/comments?per_page=100${suffix}` : kind === 'inline' ? `pulls/${ref.number}/comments?per_page=100${suffix}` : `pulls/${ref.number}/reviews?per_page=100`
     const comments = await commands.pages(CommentSchema, path, round.tally)
     for (const comment of comments) {
       // Stopping mid-read throws so the thread's cursor stays where it was.
       if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
       const timestamp = Date.parse(comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? '')
-      if (!Number.isFinite(timestamp) || timestamp < Date.parse(since)) continue
+      if (!Number.isFinite(timestamp) || timestamp < Date.parse(from)) continue
       if (sameName(comment.user.login, login)) continue
       // A review decision without a body still reaches the ticket: a worker may be waiting for that approval.
       const trigger = commentTrigger(comment, ref, kind, login)
