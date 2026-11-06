@@ -30,6 +30,21 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
 
+## This mirror
+
+This repository mirrors [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype), kept by the `cg-dsh` account for the deployment that runs this agent. `origin` is this mirror; `upstream` is the original.
+
+The only local divergence is one commit, *fix: read notifications from before the polling cursor*. GitHub indexes a notification seconds to a minute after the comment it announces, so a comment created just before the polling cursor was dropped permanently; the Source now reads notified threads from ten minutes earlier, and Trigger ids make the repeat harmless.
+
+To upgrade, replay the local commits onto upstream and rebuild. `6337fc8` is this mirror's snapshot of upstream; a plain merge is not possible because upstream rewrote its history, so the two sides share no merge base although their content matched:
+
+```
+git fetch upstream
+git rebase --onto upstream/main 6337fc8 main
+pnpm install && pnpm build
+scripts/dsh-superagent restart
+```
+
 ## Development
 
 `pnpm check` runs the typecheck, the tests and the build.
