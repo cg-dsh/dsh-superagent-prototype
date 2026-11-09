@@ -1,6 +1,6 @@
 /** GitHub source kind definition, notification and repository polling loops, and Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
-import { key, type Thread } from '../core/index.ts'
+import { key, type Thread, type Trigger } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
@@ -290,6 +290,7 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
+  await pollRequesterClosed(ctx, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error
   const { count, interval } = notified.value
@@ -411,6 +412,50 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
     }
   }
 }
+/**
+ * Notices that a person closed the Issue that started an open Ticket. A withdrawn request ends the Ticket rather than
+ * leaving it waiting on a question nobody will answer. A Ticket whose own PR is still open is the exception: the work
+ * exists, so its Executor is asked to reopen the Issue and settle the PR instead of the Ticket ending silently.
+ */
+async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<void> {
+  const commands = ctx.commands.withSignal(round.signal)
+  for (const ticket of ctx.tickets.open()) {
+    if (stopped(ctx, round)) return
+    for (const channel of ticket.channels ?? []) {
+      if (channel.source !== SOURCE) continue
+      const number = Number(channel.address.number)
+      if (!Number.isFinite(number) || number <= 0) continue
+      // A PR thread is settled by `pollTicketPulls`; only the Issue that started the Ticket can be withdrawn.
+      if ((channel.address.url ?? '').includes('/pull/')) continue
+      let issue: z.infer<typeof IssueSchema>
+      try {
+        issue = await commands.api(IssueSchema, `issues/${number}`)
+      } catch (error) {
+        if (!stopped(ctx, round)) failed(ctx, round, number, error)
+        continue
+      }
+      if (issue.state !== 'closed') continue
+      const at = (issue as { closed_at?: string | null }).closed_at ?? new Date().toISOString()
+      if (ctx.state.get(KV.github.requesterClosed(ticket.id)) === at) continue
+      ctx.state.set(KV.github.requesterClosed(ticket.id), at)
+      const open = pullsOf(ticket, true)
+      if (open.length) await ctx.receive(closedIssueTrigger(issue, number, open))
+      else ctx.tickets.requesterClosed(ticket.id, at)
+    }
+  }
+}
+/** The Trigger that tells an Executor its Issue was closed while its PR is still open. */
+function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, open: readonly number[]): Trigger {
+  const at = (issue as { closed_at?: string | null }).closed_at ?? new Date().toISOString()
+  const list = open.map(item => `#${item}`).join(', ')
+  return { id: key('github-issue-closed', String(number), at), source: SOURCE,
+    threads: [{ source: SOURCE, id: String(number) }], actor: { source: SOURCE, id: issue.user?.login ?? '' },
+    human: true, at, url: issue.html_url,
+    text: `Issue #${number} was closed while PR ${list} is still open. Reopen the Issue with one line saying why, and ask for the PR to be merged or closed; never leave it dangling.`,
+    channel: { source: SOURCE, thread: `github:${number}`, address: { number: String(number), url: issue.html_url } },
+    meta: { number, isPr: false, kind: 'issue' } }
+}
+
 export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   const numbers = [...new Set(ctx.tickets.open().flatMap(ticket => pullsOf(ticket, true)))]
   for (const number of numbers) {

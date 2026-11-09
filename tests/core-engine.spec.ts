@@ -1619,3 +1619,25 @@ describe('ignores from the card', () => {
     expect(() => h.engine.decide('5', { kind: 'accept', title: 'Fix', scope: 'small', reason: 'chat' })).toThrow(new UserError('notExplicit'))
   })
 })
+
+describe('a requester closing the thread', () => {
+  it('withdraws the request: the ticket ends as closed and an open question goes away', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'progress', summary: 'need a call', question: 'Which color?' })
+    expect(h.repo.tickets.get(ticketId)!.attention).toBeDefined()
+    h.engine.requesterClosed(ticketId, '2026-09-23T00:05:00Z')
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.ended).toMatchObject({ by: 'human', outcome: 'closed' })
+    expect(ticket.attention).toBeUndefined()
+    expect(ticket.assignments.filter(assignment => assignment.state !== 'ended')).toEqual([])
+  })
+  it('leaves an ended ticket alone', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.requesterClosed(ticketId, '2026-09-23T00:05:00Z')
+    const ended = h.repo.tickets.get(ticketId)!.ended
+    h.engine.requesterClosed(ticketId, '2026-09-23T00:09:00Z')
+    expect(h.repo.tickets.get(ticketId)!.ended).toEqual(ended)
+  })
+})
