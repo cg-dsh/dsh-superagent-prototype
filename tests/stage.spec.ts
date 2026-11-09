@@ -10,6 +10,8 @@ const attention = { id: 'q', question: '?' }
 const answered = { inputs: [{ id: 'i', kind: 'trigger' as const, triggerId: 'e', at: 'later', human: true as const }] }
 const reportedAt = (state: ReportState) => reported(state, { report: { state, summary: '', at: 'earlier' } })
 const ended = { at: '', by: 'executor' as const, reason: 'closed', outcome: 'closed' as const }
+/** A Thread the Ticket opened, such as its pull request, still open. */
+const follow = { thread: 'github:7', own: true }
 
 // The rows of the docs/003 table, in order; a Ticket that matches several rows takes the first.
 describe('ticketStage', () => {
@@ -28,6 +30,10 @@ describe('ticketStage', () => {
     ['a pending Assignment', ticket({ assignments: [reported('failed', { state: 'ended' }), assignment({ state: 'pending' })] }), { stage: 'working', action: 'queued' }],
     ['a waiting Report', ticket({ assignments: [reported('waiting')] }), { stage: 'idle' }],
     ['an ended Assignment', ticket({ assignments: [assignment({ state: 'ended' })] }), { stage: 'idle' }],
+    ['a waiting Report with its own PR still open', ticket({ assignments: [reported('waiting')], follows: [follow] }), { stage: 'person', action: 'review' }],
+    ['an ended Assignment with its own PR still open', ticket({ assignments: [assignment({ state: 'ended' })], follows: [follow] }), { stage: 'person', action: 'review' }],
+    ['a waiting Report whose own PR closed', ticket({ assignments: [reported('waiting')], follows: [{ ...follow, closed: { at: '', outcome: 'merged' as const } }] }), { stage: 'idle' }],
+    ['a waiting Report following an open PR it did not open', ticket({ assignments: [reported('waiting')], follows: [{ thread: 'github:9', own: false }] }), { stage: 'idle' }],
     ['a running Assignment', ticket(), { stage: 'working' }],
     ['a progress Report', ticket({ assignments: [reported('progress')] }), { stage: 'working' }],
     ['an ended Ticket', ticket({ ended, attention, assignments: [reported('failed')] }), { stage: 'ended' }],

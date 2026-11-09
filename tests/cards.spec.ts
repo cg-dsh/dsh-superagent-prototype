@@ -158,7 +158,10 @@ it('shows a trigger and a ticket as cards with a short preview and references to
 it('shows a ticket card\'s state from a closed set: the open ticket\'s stage, the ended ticket\'s outcome', () => {
   const report = (state: string) => ({ ...ticket, assignments: [{ ...ticket.assignments[0]!, report: { state, summary: '', at: '' } }] }) as Ticket
   const cases: [Ticket, string][] = [
-    [ticket, 'person/review'], [report('blocked'), 'person/blocked'], [report('failed'), 'person/failed'], [report('waiting'), 'idle'], [report('progress'), 'working'],
+    [ticket, 'person/review'], [report('blocked'), 'person/blocked'], [report('failed'), 'person/failed'], [report('progress'), 'working'],
+    // A waiting report with its own PR still open waits for a person; once the PR closes it is idle.
+    [report('waiting'), 'person/review'],
+    [{ ...report('waiting'), follows: [{ thread: 'github:42', own: true, closed: { at: '', outcome: 'merged' } }] }, 'idle'],
     [{ ...ticket, attention: { id: 'q', question: 'Desktop too?' } }, 'person/answer'], [{ ...ticket, delivery: { error: 'gone', at: '' } }, 'person/delivery'],
     [{ ...ticket, assignments: [{ ...ticket.assignments[0]!, state: 'pending', report: undefined }] }, 'working/queued'],
     [{ ...ticket, ended: { at: 'e', by: 'human', reason: 'Not needed after all', outcome: 'stopped' } }, 'stopped'],
@@ -166,7 +169,8 @@ it('shows a ticket card\'s state from a closed set: the open ticket\'s stage, th
   ]
   for (const [item, state] of cases) expect(ticketCard(item).state).toBe(state)
   expect(cases.map(([item]) => ticketCard(item).state).every(state => (TICKET_STATES as readonly string[]).includes(state))).toBe(true)
-  expect(ticketCard(cases[8]![0])).toMatchObject({ ended: { at: 'e', by: 'human', reason: 'Not needed after all' } })
+  const stopped = cases.find(([item]) => item.ended?.reason === 'Not needed after all')![0]
+  expect(ticketCard(stopped)).toMatchObject({ ended: { at: 'e', by: 'human', reason: 'Not needed after all' } })
   expect(ticketCard(ticket)).toMatchObject({ ticket_id: 'ticket-1', pr_number: 42, strength: 'explicit' })
   expect(ticketCard(ticket)).not.toHaveProperty('attention')
   expect(ticketCard({ ...ticket, attention: { id: 'q', question: 'Desktop too?' } })).toMatchObject({ attention: { question: 'Desktop too?' } })
