@@ -64,6 +64,11 @@ export class Engine {
     this.repo.atomic(() => { this.tickets.threadClosed(thread, outcome, isoTime(at)) })
   }
 
+  /** A Source's fact that a person closed the Thread that started a Ticket, which withdraws the request. */
+  requesterClosed(ticketId: string, at: string): void {
+    this.repo.atomic(() => { this.tickets.requesterClosed(ticketId, isoTime(at)) })
+  }
+
   // The clock
 
   /**
@@ -258,7 +263,7 @@ export class Engine {
 }
 
 /** What Sources ask and tell the Engine. */
-export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
+export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed' | 'requesterClosed'>
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */

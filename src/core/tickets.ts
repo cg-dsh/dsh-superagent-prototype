@@ -89,6 +89,14 @@ export class Tickets extends EnginePart {
     }
   }
   /**
+   * A person closed the Thread that started the Ticket: the request is withdrawn, so it ends instead of waiting on a
+   * question nobody will answer. A Ticket that still has an open PR is the exception, and its Source asks the Executor
+   * to settle that PR first.
+   */
+  requesterClosed(ticketId: string, at: string): void {
+    this.end(ticketId, 'human', 'closed', at, 'requesterClosed')
+  }
+  /**
    * How a ticket that follows Threads is done with them: once no Thread it opened (`own`) is still open, or, when it opened none,
    * once every one it follows closed. It ends as the latest close among those Threads did; undefined while it is not done.
    */
