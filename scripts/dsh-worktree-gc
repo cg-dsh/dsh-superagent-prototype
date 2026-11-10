@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Remove a finished Ticket's worktree and its branch, without losing uncommitted work.
+
+A squash-merged branch has no commits on the remote, so ancestry cannot prove safety; the check that matters is the
+working tree. Refuses a worktree with uncommitted changes unless --force is given, prints one line for the record, and
+prunes the repository afterwards so its bookkeeping does not accumulate either.
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+
+def git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['git', *args], capture_output=True, text=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('directory', help="The Ticket's worktree to remove.")
+    parser.add_argument('--force', action='store_true', help='Remove even with uncommitted changes.')
+    parser.add_argument('--dry-run', action='store_true', help='Report what would happen, then stop.')
+    args = parser.parse_args()
+
+    directory = Path(args.directory).resolve()
+    if not directory.exists():
+        print(f'{directory}: absent; nothing to remove')
+        return 0
+
+    common = git('-C', str(directory), 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    if common.returncode != 0:
+        print(f'{directory}: not a git worktree; refusing to delete it')
+        return 1
+    clone = Path(common.stdout.strip()).parent
+
+    listing = git('-C', str(clone), 'worktree', 'list', '--porcelain').stdout
+    if f'worktree {directory}' not in listing.splitlines():
+        print(f'{directory}: not a worktree of {clone}; refusing to delete it')
+        return 1
+
+    branch = git('-C', str(directory), 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    dirty = git('-C', str(directory), 'status', '--porcelain').stdout.strip()
+    if dirty and not (args.force or args.dry_run):
+        changed = len(dirty.splitlines())
+        print(f'{directory}: {changed} uncommitted change(s); refusing without --force', file=sys.stderr)
+        return 1
+
+    behind = 'detached' if branch == 'HEAD' else git('-C', str(clone), 'rev-list', '--count', '--not', '--remotes', branch).stdout.strip()
+    if args.dry_run:
+        print(f'{directory}: would remove worktree on {branch} ({behind} commit(s) not on a remote)')
+        return 0
+
+    removed = git('-C', str(clone), 'worktree', 'remove', '--force', str(directory))
+    if removed.returncode != 0:
+        print(f'{directory}: git refused to remove it: {removed.stderr.strip()}', file=sys.stderr)
+        return 1
+    gone = ' kept' if branch in ('HEAD', 'main', 'master') else ''
+    if not gone:
+        git('-C', str(clone), 'branch', '-D', branch)
+    git('-C', str(clone), 'worktree', 'prune')
+    print(f'{directory}: removed worktree; branch {branch}{" kept" if gone else " deleted"} ({behind} commit(s) not on a remote)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
