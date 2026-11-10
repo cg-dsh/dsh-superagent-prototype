@@ -15,6 +15,11 @@ export const page = <T>(items: T[], offset: number, limit: number) => ({ items: 
 const DAY = 86_400_000
 export const dayAgo = () => new Date(Date.now() - DAY).toISOString()
 export const newestFirst = (a: Ticket, b: Ticket) => b.updatedAt.localeCompare(a.updatedAt)
+/**
+ * Arrival order for a work queue: oldest first, so a row keeps its place while it is worked through and new Tickets
+ * appear at the end. Ties fall back to the id, so the order never depends on the sort being stable.
+ */
+export const queueOrder = (a: Ticket, b: Ticket) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
 
 /** Sender projection for the UI; automated notices have an empty `id` and no `name`. */
 export interface ActorView { source: string; id: string; name?: Localized }

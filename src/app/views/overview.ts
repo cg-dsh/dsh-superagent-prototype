@@ -4,7 +4,7 @@ import type { Health } from '../../sources/host.ts'
 import type { SetupProblem } from '../../setup.ts'
 import { anyoneAllowed } from '../../policy.ts'
 import type { Store } from '../store.ts'
-import { awaitingEval, dayAgo, newestFirst, ownersOf, snapshot, threadSummary, type ViewHost } from './records.ts'
+import { awaitingEval, dayAgo, ownersOf, queueOrder, snapshot, threadSummary, type ViewHost } from './records.ts'
 import { sourceHealth, type HealthMap } from './sources.ts'
 import { ticketRow, type ExecutorLoad } from './tickets.ts'
 import { preview } from './text.ts'
@@ -64,7 +64,7 @@ export function overview(host: ViewHost, health: HealthMap, policyVersionValue: 
       text: preview(item.text),
       attempts: item.attempts, error: item.error } })),
   ]
-  const open = store.tickets.open().sort(newestFirst)
+  const open = store.tickets.open().sort(queueOrder)
   const stats = Object.values(store.read.triggerStats(since))
   const received = stats.reduce((sum, item) => sum + item.received, 0), filtered = stats.reduce((sum, item) => sum + item.filtered, 0)
   const judgement = store.read.flow(since)

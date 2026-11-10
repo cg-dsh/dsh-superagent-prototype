@@ -2,12 +2,13 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import type { Ticket } from '../src/core/index.ts'
 import { Store } from '../src/app/store.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
-import { snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
+import { newestFirst, queueOrder, snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
 import { basisFacts, ticketDetail } from '../src/app/views/tickets.ts'
 import { threadDetail } from '../src/app/views/threads.ts'
 import { droppedReplies, sourcesStatus } from '../src/app/views/sources.ts'
@@ -34,6 +35,19 @@ const drop = (id: string, channel: ChannelRef, ticketId?: string) => {
   store.receipts.add(message)
   store.receipts.settle(message, 'channelGone')
 }
+
+it('orders a work queue by arrival, so a row keeps its place while it is worked through', () => {
+  const ticket = (id: string, createdAt: string, updatedAt: string) => ({ id, createdAt, updatedAt }) as unknown as Ticket
+  const older = ticket('b', '2026-09-09T00:00:00Z', '2026-09-11T00:00:00Z')
+  const newer = ticket('a', '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')
+  expect([newer, older].sort(queueOrder)).toEqual([older, newer])
+  // Opening order decides: a Ticket touched later does not jump the queue.
+  expect([older, newer].sort(queueOrder)).toEqual([older, newer])
+  // Ties fall back to the id, so the order never depends on the sort being stable.
+  expect([ticket('b', '2026-09-09T00:00:00Z', ''), ticket('a', '2026-09-09T00:00:00Z', '')].sort(queueOrder).map(item => item.id)).toEqual(['a', 'b'])
+  // Search results keep the newest change first.
+  expect([older, newer].sort(newestFirst)).toEqual([older, newer])
+})
 
 it('names the Thread of each dropped message: the one of the Trigger its Channel answers, or the Channel\'s own', () => {
   // A Feishu Channel names its chat; the message it answers belongs to the Thread of the topic's root message.
