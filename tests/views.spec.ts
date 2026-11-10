@@ -8,7 +8,7 @@ import { SettingsSchema } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
-import { newestFirst, queueOrder, snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
+import { newestFirst, personSince, queueOrder, snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
 import { basisFacts, ticketDetail } from '../src/app/views/tickets.ts'
 import { threadDetail } from '../src/app/views/threads.ts'
 import { droppedReplies, sourcesStatus } from '../src/app/views/sources.ts'
@@ -36,17 +36,26 @@ const drop = (id: string, channel: ChannelRef, ticketId?: string) => {
   store.receipts.settle(message, 'channelGone')
 }
 
-it('orders a work queue by arrival, so a row keeps its place while it is worked through', () => {
-  const ticket = (id: string, createdAt: string, updatedAt: string) => ({ id, createdAt, updatedAt }) as unknown as Ticket
-  const older = ticket('b', '2026-09-09T00:00:00Z', '2026-09-11T00:00:00Z')
-  const newer = ticket('a', '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')
-  expect([newer, older].sort(queueOrder)).toEqual([older, newer])
-  // Opening order decides: a Ticket touched later does not jump the queue.
-  expect([older, newer].sort(queueOrder)).toEqual([older, newer])
-  // Ties fall back to the id, so the order never depends on the sort being stable.
-  expect([ticket('b', '2026-09-09T00:00:00Z', ''), ticket('a', '2026-09-09T00:00:00Z', '')].sort(queueOrder).map(item => item.id)).toEqual(['a', 'b'])
+it('orders a work queue by when it started waiting for a person, so answering one does not move the others', () => {
+  const at = (id: string, createdAt: string, reportAt: string, state = 'ready', updatedAt = reportAt) => ({
+    id, createdAt, updatedAt, decisionId: 'd', title: 't', channels: [], inputs: [], undelivered: [],
+    mandate: { strength: 'explicit', policyVersion: 'v', basis: { via: 'listed' }, actor: { source: 'x', id: 'a' }, scope: '' },
+    origin: { triggerId: 'x', triggerIds: ['x'] },
+    assignments: [{ id: 'a', state: 'running', createdAt: reportAt, report: { state, summary: '', at: reportAt } }],
+  }) as unknown as Ticket
+  // Waiting since the 10th comes before waiting since the 12th, whatever their ids or creation times.
+  const early = at('b', '2026-09-09T00:00:00Z', '2026-09-10T00:00:00Z')
+  const late = at('a', '2026-09-11T00:00:00Z', '2026-09-12T00:00:00Z')
+  expect([late, early].sort(queueOrder)).toEqual([early, late])
+  expect(personSince(early)).toBe('2026-09-10T00:00:00Z')
+  // A later touch does not move it.
+  expect([late, { ...early, updatedAt: '2026-09-20T00:00:00Z' }].sort(queueOrder)).toEqual([{ ...early, updatedAt: '2026-09-20T00:00:00Z' }, late])
+  // Tickets that need nobody come after the ones that do, in arrival order.
+  const working = at('c', '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', 'progress')
+  expect([working, late, early].sort(queueOrder)).toEqual([early, late, working])
+  expect(personSince(working)).toBeUndefined()
   // Search results keep the newest change first.
-  expect([older, newer].sort(newestFirst)).toEqual([older, newer])
+  expect([early, late].sort(newestFirst)).toEqual([late, early])
 })
 
 it('names the Thread of each dropped message: the one of the Trigger its Channel answers, or the Channel\'s own', () => {
