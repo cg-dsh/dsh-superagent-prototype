@@ -12,8 +12,8 @@ import type { Store } from './store.ts'
 
 /** Maximum runtime for one cleanup command; a hung command must not hold the queue. */
 export const CLEANUP_TIMEOUT_MS = 10 * 60_000
-/** How often ended Tickets are checked for cleanup, so an end while the host was down is still collected. */
-const SWEEP_MS = 60_000
+/** A catch-up only: a Ticket that ended while the host was down is collected on the next sweep. */
+const SWEEP_MS = 3 * 3600_000
 
 /** True when an ended Ticket has a directory and no recorded attempt: cleanup runs once per Ticket. */
 export function needsCleanup(ticket: Pick<Ticket, 'ended' | 'execution' | 'id'>, recorded: string | undefined): boolean {
@@ -44,6 +44,14 @@ export class Cleanup {
 
   stop(): void {
     clearInterval(this.timer)
+  }
+
+  /** Enqueues cleanup for one Ticket that just ended; a disabled command keeps every directory. */
+  request(ticketId: string): void {
+    if (this.host.closing() || !this.host.store.settings().executor.cleanup.trim()) return
+    const ticket = this.host.store.tickets.get(ticketId)
+    if (!ticket || !needsCleanup(ticket, this.host.store.get(KV.cleanup(ticketId)))) return
+    this.host.effects.enqueue('cleanup', ticket.id, { ticketId: ticket.id })
   }
 
   /** Enqueues one cleanup per ended Ticket that no earlier attempt recorded; a disabled command keeps every directory. */
