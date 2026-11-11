@@ -154,7 +154,9 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
 
-   List personal CLIs, such as one signed in to your own account, as blocked commands.
+   List personal CLIs, such as one signed in to your own account, as blocked commands. Add a cleanup command to
+   remove each Ticket's workspace once it ends; `scripts/dsh-worktree-gc` removes the worktree and its branch and
+   refuses one with uncommitted changes.
 4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
 
 ### Management API

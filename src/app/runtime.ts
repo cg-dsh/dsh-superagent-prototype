@@ -36,6 +36,7 @@ import { eventNotice, followupNotice } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
+import { Cleanup } from './cleanup.ts'
 import { Passes } from './passes.ts'
 import { Setup } from './setup.ts'
 import { feishuSettings } from '../sources/feishu.ts'
@@ -70,6 +71,7 @@ export class Runtime extends Service implements SourceHost {
   readonly outbox: Outbox
   readonly engine: Engine
   readonly passes: Passes
+  private readonly cleanup: Cleanup
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
@@ -128,6 +130,8 @@ export class Runtime extends Service implements SourceHost {
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+      this.cleanup = new Cleanup({ store, effects, subprocess: ctx.subprocess, environment, lifetime: this.lifetime,
+        closing: () => this.closing() })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -144,6 +148,8 @@ export class Runtime extends Service implements SourceHost {
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
+          // Remove the finished workspace at once; the periodic sweep only catches ends the host missed.
+          if (event.type === 'ticket.ended') this.cleanup.request(event.data.ticketId)
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {
@@ -214,6 +220,7 @@ export class Runtime extends Service implements SourceHost {
     this.executor.resume()
     this.passes.start()
     this.effects.start()
+    this.cleanup.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
   private httpHost(): HttpHost {
@@ -228,7 +235,7 @@ export class Runtime extends Service implements SourceHost {
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
-    this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
+    this.closingFlag = true; this.cleanup.stop(); const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]

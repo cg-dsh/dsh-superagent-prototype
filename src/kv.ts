@@ -49,6 +49,8 @@ export const KV = {
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:'),
     requesterClosed: family<string, [ticketId: string]>('github-requester-closed:') },
+  /** One record per Ticket whose cleanup command ran, so it never runs twice. */
+  cleanup: family<string, [ticketId: string]>('cleanup:'),
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.
