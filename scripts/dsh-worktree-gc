@@ -7,6 +7,7 @@ the remote is the proof that it was merged or deliberately deleted. Until then t
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,19 @@ def git(*args: str, timeout: float | None = None) -> subprocess.CompletedProcess
                               env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(['git', *args], 124, '', f'git timed out after {timeout}s')
+
+
+def remove_mirror(directory: Path) -> None:
+    """Remove the Windows copy a net48 build made for this checkout, by the name `build-net48.sh` gives it."""
+    root = os.environ.get('DSH_NET48_MIRRORS') or '/mnt/d/cghg-wt'
+    mirror = Path(root) / f'net48-{directory.name}'
+    if not mirror.is_dir():
+        return
+    shutil.rmtree(mirror, ignore_errors=True)
+    if mirror.exists():
+        print(f'{mirror}: could not remove the build copy', file=sys.stderr)
+    else:
+        print(f'{mirror}: removed the build copy')
 
 
 def main() -> int:
@@ -81,6 +95,7 @@ def main() -> int:
     git('-C', str(clone), 'worktree', 'prune')
     where = f'gone from {remote}' if not heads.stdout.strip() else 'still on the remote, forced'
     print(f'{directory}: removed worktree and branch {branch} ({where})')
+    remove_mirror(directory)
     return 0
 
 
