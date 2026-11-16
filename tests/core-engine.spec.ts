@@ -720,6 +720,16 @@ describe('interrupted assignments', () => {
     expect(h.repo.tickets.get(waiting)!.assignments).toHaveLength(1)
     expect(h.executor.deliver).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: waiting }), expect.objectContaining({ state: 'running' }))
   })
+  it('starts again a worker that failed and then lost its session, instead of keeping a session that is gone', () => {
+    const h = harness()
+    const failed = accepted(h).ticketId!
+    h.engine.report(failed, { state: 'failed', summary: 'Error: working-directory: directory does not exist' })
+    const running = runningAssignment(h.repo.tickets.get(failed)!)!
+    h.engine.assignmentInterrupted(failed, running.id)
+    const ticket = h.repo.tickets.get(failed)!
+    expect(ticket.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+    expect(ticket.inputs.at(-1)).toMatchObject({ kind: 'text', text: expect.stringContaining('The host restarted') })
+  })
   it('starts again a worker that reported but then got a person\'s message, which it was working on', () => {
     const h = harness()
     const other = accepted(h, '2', 't2').ticketId!

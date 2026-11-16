@@ -77,8 +77,9 @@ export class Assignments extends EnginePart {
   }
   /**
    * Handles a running assignment interrupted by a host restart: restarts it with a recovery note unless its latest report is
-   * `waiting`, `ready`, `blocked`, or `failed` and no input was delivered after that report, in which case it keeps its
-   * session and flushes any waiting undelivered inputs.
+   * `waiting`, `ready`, or `blocked` and no input was delivered after that report, in which case it keeps its session and
+   * flushes any waiting undelivered inputs. A `failed` report is restarted: its session is gone, and the failure — such as a
+   * working directory that no longer exists — needs a fresh attempt, not a kept one.
    */
   interrupted(ticketId: string, assignmentId: string): void {
     const ticket = this.running(ticketId, assignmentId)
@@ -86,7 +87,7 @@ export class Assignments extends EnginePart {
     if (!ticket || !running) return
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
-    const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy
+    const settled = !!report && ['waiting', 'ready', 'blocked'].includes(report.state) && !busy
     if (!settled) this.tickets.restart(ticket, running, 'hostRestarted', RECOVERY_NOTE)
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
