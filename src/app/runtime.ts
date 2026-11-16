@@ -150,6 +150,8 @@ export class Runtime extends Service implements SourceHost {
           if (followup) sessions.relay(followup.id, followup.text)
           // Remove the finished workspace at once; the periodic sweep only catches ends the host missed.
           if (event.type === 'ticket.ended') this.cleanup.request(event.data.ticketId)
+          // A resumed Ticket keeps its workspace, so a cleanup queued for its earlier end is pointless.
+          if (event.type === 'ticket.resumed') this.cleanup.forget(event.data.ticketId)
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {

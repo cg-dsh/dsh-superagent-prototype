@@ -15,14 +15,31 @@ export const CLEANUP_TIMEOUT_MS = 10 * 60_000
 /** A catch-up only: a Ticket that ended while the host was down is collected on the next sweep. */
 const SWEEP_MS = 3 * 3600_000
 
-/** True when an ended Ticket has a directory and no recorded attempt: cleanup runs once per Ticket. */
-export function needsCleanup(ticket: Pick<Ticket, 'ended' | 'execution' | 'id'>, recorded: string | undefined): boolean {
-  return !!ticket.ended && !!ticket.execution?.directory && recorded === undefined
+/**
+ * How long a Ticket stays ended before its workspace may be removed. A message on any of its Threads resumes it, and the
+ * merge that ended it is usually followed by one, so a workspace removed at once is one a resuming worker still needs.
+ */
+export const CLEANUP_GRACE_MS = 10 * 60_000
+
+/**
+ * True when an ended Ticket has a directory and no recorded attempt, and nothing has happened to it since it ended:
+ * cleanup runs once per Ticket, and never while a resumed worker may still be using the workspace.
+ */
+export function needsCleanup(
+  ticket: Pick<Ticket, 'ended' | 'execution' | 'id' | 'assignments'>,
+  recorded: string | undefined,
+  now = Date.now(),
+): boolean {
+  if (!ticket.ended || !ticket.execution?.directory || recorded !== undefined) return false
+  const endedAt = Date.parse(ticket.ended.at)
+  if (now - endedAt < CLEANUP_GRACE_MS) return false
+  // An assignment made after the end means the Ticket resumed: it is finished only when it ends again, with a newer date.
+  return !(ticket.assignments ?? []).some(assignment => Date.parse(assignment.createdAt) > endedAt)
 }
 
 export interface CleanupHost {
   store: Store
-  effects: Pick<Effects, 'enqueue' | 'handle'>
+  effects: Pick<Effects, 'enqueue' | 'handle' | 'cancel'>
   subprocess: SubprocessRuntime
   /** The execution environment variables of a Ticket, as its prepare command receives them. */
   environment: (ticket: Ticket) => { key: string; value: string }[]
@@ -54,6 +71,11 @@ export class Cleanup {
     this.host.effects.enqueue('cleanup', ticket.id, { ticketId: ticket.id })
   }
 
+  /** A resumed Ticket keeps its workspace, so a cleanup queued for its earlier end is pointless. */
+  forget(ticketId: string): void {
+    this.host.effects.cancel('cleanup', ticketId)
+  }
+
   /** Enqueues one cleanup per ended Ticket that no earlier attempt recorded; a disabled command keeps every directory. */
   sweep(): void {
     if (this.host.closing() || !this.host.store.settings().executor.cleanup.trim()) return
@@ -67,15 +89,21 @@ export class Cleanup {
     const ticket = this.host.store.tickets.get(ticketId)
     const command = this.host.store.settings().executor.cleanup.trim()
     const directory = ticket?.execution?.directory ?? ''
-    // A resumed Ticket is not cleaned, and a command removed meanwhile keeps the directory.
-    if (!ticket || liveTicket(ticket) || !command || !directory) return
-    const recorded = this.host.store.get(KV.cleanup(ticketId)) ?? ''
-    const attempts = Number(/^failed:(\d+)/.exec(recorded)?.[1] ?? 0)
+    const recorded = this.host.store.get(KV.cleanup(ticketId))
+    // A resumed Ticket is not cleaned, a command removed meanwhile keeps the directory, and the grace period has to pass.
+    if (!ticket || !command || !directory || !needsCleanup(ticket, recorded, Date.now())) return
+    const attemptsText = recorded ?? ''
+    const attempts = Number(/^failed:(\d+)/.exec(attemptsText)?.[1] ?? 0)
     const environment = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(CLEANUP_TIMEOUT_MS)])
     try {
       await runAsWorker(this.host.subprocess, ['sh', '-c', command], dirname(directory), signal, environment)
-      this.host.store.set(KV.cleanup(ticketId), `ok:${new Date().toISOString()}`)
+      // A message can resume a Ticket while the command runs, and the command may already have removed the workspace: record
+      // that rather than claiming a clean removal, so a person can see why a worker lost its checkout.
+      const after = this.host.store.tickets.get(ticketId)
+      const resumed = after && liveTicket(after)
+      this.host.store.set(KV.cleanup(ticketId),
+        resumed ? `interrupted:${new Date().toISOString()}` : `ok:${new Date().toISOString()}`)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const next = attempts + 1
