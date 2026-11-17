@@ -135,6 +135,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   if (!ctx.configured()) { ctx.report('github', health('paused', 'setupPending')); return }
   while (!signal.aborted) {
     const config = ctx.config<GithubConfig>(SOURCE)
+    const began = Date.now()
     try {
       if (config) interval = await pollRound(ctx, signal)
       else ctx.report('github', health('paused', 'sourceOff'))
@@ -144,7 +145,9 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       const failed = pollFailure(failures, config?.failuresBeforeError ?? 1, error)
       if (!signal.aborted && failed) ctx.report('github', failed)
     }
-    await pause(Math.max(interval, ctx.config<GithubConfig>(SOURCE)?.pollSeconds ?? 60) * 1000, signal)
+    // A round that already outlasted the interval has waited long enough: the cadence is the round, not the round plus a pause.
+    const wait = Math.max(interval, ctx.config<GithubConfig>(SOURCE)?.pollSeconds ?? 60) * 1000 - (Date.now() - began)
+    await pause(Math.max(wait, 0), signal)
   }
 }
 interface Round {
@@ -310,10 +313,9 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const dropped = (round.dropped.length ? `; deleted on GitHub: ${named(round.dropped)}` : '')
     + (round.abandoned.length ? `; dropped after their reads kept failing: ${named(round.abandoned)}` : '')
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
-  const took = ((Date.now() - began) / 1000).toFixed(1)
-  ctx.report('github', { state: 'ready',
-    detail: `${count} notifications in ${took}s (${spent.join(', ')}); next poll ≥ ${interval}s${dropped}`,
-    at: new Date().toISOString() })
+  // The health text stays stable for its readers; where a round spends its time goes to the log that diagnoses latency.
+  console.info(`github poll round: ${((Date.now() - began) / 1000).toFixed(1)}s (${spent.join(', ')})`)
+  ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
   return interval
 }
 /** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
