@@ -32,6 +32,7 @@ import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
+import { MASTER_CONTEXT_LIMIT, handover } from './handover.ts'
 import { eventNotice, followupNotice } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
@@ -72,10 +73,44 @@ export class Runtime extends Service implements SourceHost {
   readonly engine: Engine
   readonly passes: Passes
   private readonly cleanup: Cleanup
+  /**
+   * Replaces the orchestrator session when its prompt has grown past the limit, before anything is delivered to it.
+   *
+   * A router's state is the Ticket map and its recent decisions, which the handover rebuilds from the store; a model summary
+   * would cost a large call and could lose a Ticket. The retired session stays on disk.
+   */
+  private async masterHeadroom(): Promise<void> {
+    if (this.closing() || this.rotating) return
+    const size = await this.sessions.promptSize(this.masterId)
+    if (size < MASTER_CONTEXT_LIMIT) return
+    this.rotating = true
+    try {
+      await this.rotateMaster(size)
+    } finally {
+      this.rotating = false
+    }
+  }
+
+  private async rotateMaster(size: number): Promise<void> {
+    const retired = this.masterId
+    const at = new Date().toISOString()
+    const id = `orchestrator-${key(this.machine.stateDir, at)}`
+    const text = handover({ tickets: this.store.tickets.list(), decisions: this.store.decisions.list(),
+      verdict: await this.sessions.lastText(retired), at })
+    this.master = id
+    this.store.set(KV.runtime.masterId, id)
+    await this.sessions.ensure(id, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    this.runtimeHealth.set({ state: 'ready', detail: `orchestrator replaced at ${size.toLocaleString('en')} tokens`, at })
+    await this.sessions.prompt(id, `handover-${id}`, text, 'queue')
+  }
+
   readonly ready: Promise<void>
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
-  readonly masterId: string
+  private master = ''
+  private rotating = false
+  /** The current orchestrator session, which is replaced once its prompt passes the limit. */
+  get masterId(): string { return this.master }
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
   private readonly disposers: (() => void)[] = []
@@ -103,7 +138,7 @@ export class Runtime extends Service implements SourceHost {
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
-      const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
+      const masterId = this.master = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
@@ -117,10 +152,12 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands,
+        masterId: () => this.masterId, context: ctx,
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
+      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'),
+        masterId: () => this.masterId, headroom: () => this.masterHeadroom(),
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })

@@ -366,6 +366,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/app/cleanup.ts` | The cleanup command a Ticket's end runs once, so finished workspaces do not accumulate |
+| `src/app/handover.ts` | The deterministic state a replacement orchestrator session starts from |
 | `src/sources/github-projects.ts` | GitHub Projects (v2) after a merge: the column a merged PR's Issues move to, chosen from each project's own status options |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
@@ -409,6 +410,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/cleanup.spec.ts` | Which ended Tickets the cleanup command still has to visit |
+| `tests/handover.spec.ts` | What a replacement orchestrator session is told, and what it is not |
 | `tests/projects.spec.ts` | The project column a merged PR moves to: matching a hint against the columns a project offers, and never choosing a finished one |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |

@@ -29,7 +29,10 @@ export interface SessionsHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
-  readonly masterId: string
+  /** The current orchestrator session; it changes when the session is replaced for context. */
+  masterId(): string
+  /** Called before a delivery to the master, so the session can be replaced when its prompt has grown too large. */
+  headroom?: () => Promise<void>
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
@@ -101,7 +104,7 @@ export class Sessions {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
     // Deliver relays and notices to the main Session in the order they were queued.
-    host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
+    host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId(), requestId, text, 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
@@ -124,7 +127,7 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const ours = sessionId === this.host.masterId() ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -161,10 +164,42 @@ export class Sessions {
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
+    // Every delivery to the orchestrator passes here, so it can be replaced for context before anything reaches it.
+    if (sessionId === this.host.masterId()) {
+      await this.host.headroom?.()
+      sessionId = this.host.masterId()
+    }
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
   }
+  /** The size of the prompt a session's last request sent: uncached input plus what the provider served from cache. */
+  async promptSize(sessionId: string): Promise<number> {
+    const resolved = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
+    if ('error' in resolved) return 0
+    const events = resolved.agent.session.snapshotEvents()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const usage = (events[index]!.data as { usage?: { inputTokens?: number; cacheReadTokens?: number } }).usage
+      if (usage?.inputTokens !== undefined) return usage.inputTokens + (usage.cacheReadTokens ?? 0)
+    }
+    return 0
+  }
+
+  /** The last text a session said, which a handover carries as the verdict of the session it replaces. */
+  async lastText(sessionId: string): Promise<string | undefined> {
+    const resolved = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
+    if ('error' in resolved) return undefined
+    const events = resolved.agent.session.snapshotEvents()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]!
+      if (event.type !== 'assistant/message') continue
+      const parts = (event.data as unknown as { message?: { content?: readonly { type: string; text?: string }[] } }).message?.content ?? []
+      const said = parts.filter(part => part.type === 'text' && part.text?.trim()).map(part => part.text!.trim()).join('\n')
+      if (said) return said
+    }
+    return undefined
+  }
+
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
@@ -178,7 +213,7 @@ export class Sessions {
   }
   /** Injects a notice into the main Session without waking it; no-op if the main Session does not exist yet. */
   private async inject(name: string, value: Record<string, unknown>, summary: string): Promise<void> {
-    const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
+    const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId() as SessionId)
     if ('error' in resolved) return
     // Deduplicate by notice name and payload hash so retries are idempotent while updated payloads still deliver.
     const text = JSON.stringify(value)
@@ -232,7 +267,7 @@ export class Sessions {
   private async decorate(agent: Agent): Promise<void> {
     if (this.bindings.has(agent)) return
     const host = this.host
-    const master = agent.id === host.masterId
+    const master = agent.id === host.masterId()
     const ticket = master ? undefined : this.ticketOf(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
