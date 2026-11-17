@@ -12,7 +12,7 @@ import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
-import { cursorAt, pause, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
+import { cursorAt, eachLimit, pause, POLL_CONCURRENCY, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
 
@@ -419,7 +419,7 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
  */
 async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
-  for (const ticket of ctx.tickets.open()) {
+  await eachLimit(ctx.tickets.open(), POLL_CONCURRENCY, async ticket => {
     if (stopped(ctx, round)) return
     for (const channel of ticket.channels ?? []) {
       if (channel.source !== SOURCE) continue
@@ -442,7 +442,7 @@ async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<vo
       if (open.length) await ctx.receive(closedIssueTrigger(issue, number, open))
       else ctx.tickets.requesterClosed(ticket.id, at)
     }
-  }
+  })
 }
 /** The Trigger that tells an Executor its Issue was closed while its PR is still open. */
 function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, open: readonly number[]): Trigger {
@@ -458,13 +458,13 @@ function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, 
 
 export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   const numbers = [...new Set(ctx.tickets.open().flatMap(ticket => pullsOf(ticket, true)))]
-  for (const number of numbers) {
+  await eachLimit(numbers, POLL_CONCURRENCY, async number => {
     if (stopped(ctx, round)) return
     try {
       const pr = await pull(ctx, round, number)
       if (pr.state !== 'closed' && !pr.merged) await pollChecks(ctx, round, number, pr)
     } catch (error) { if (!stopped(ctx, round)) failed(ctx, round, number, error) }
-  }
+  })
 }
 /** Polls a PR's CI checks; only changes after the first baseline observation become Triggers. */
 async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<void> {
