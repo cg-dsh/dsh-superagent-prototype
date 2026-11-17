@@ -61,7 +61,7 @@ export interface ResourceHost {
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
   readonly commands: Commands
-  /** The current orchestrator session, which changes when the session is replaced for context. */
+  /** The orchestrator session id. */
   masterId(): string
   readonly context: Context
   promptVersion(sessionId: string): PromptVersion

@@ -74,10 +74,10 @@ export class Runtime extends Service implements SourceHost {
   readonly passes: Passes
   private readonly cleanup: Cleanup
   /**
-   * Replaces the orchestrator session when its prompt has grown past the limit, before anything is delivered to it.
+   * Replaces the orchestrator's history when its prompt has grown past the limit, before anything is delivered to it.
    *
    * A router's state is the Ticket map and its recent decisions, which the handover rebuilds from the store; a model summary
-   * would cost a large call and could lose a Ticket. The retired session stays on disk.
+   * would cost a large call and could lose a Ticket. The session keeps its id and log, so the thread continues.
    */
   private async masterHeadroom(): Promise<void> {
     if (this.closing() || this.rotating) return
@@ -92,16 +92,16 @@ export class Runtime extends Service implements SourceHost {
   }
 
   private async rotateMaster(size: number): Promise<void> {
-    const retired = this.masterId
     const at = new Date().toISOString()
-    const id = `orchestrator-${key(this.machine.stateDir, at)}`
     const text = handover({ tickets: this.store.tickets.list(), decisions: this.store.decisions.list(),
-      verdict: await this.sessions.lastText(retired), at })
-    this.master = id
-    this.store.set(KV.runtime.masterId, id)
-    await this.sessions.ensure(id, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
-    this.runtimeHealth.set({ state: 'ready', detail: `orchestrator replaced at ${size.toLocaleString('en')} tokens`, at })
-    await this.sessions.prompt(id, `handover-${id}`, text, 'queue')
+      verdict: await this.sessions.lastText(this.masterId), at })
+    try {
+      if (!await this.sessions.replaceMasterHistory(text)) return
+      this.runtimeHealth.set({ state: 'ready', detail: `orchestrator history replaced at ${size.toLocaleString('en')} tokens`, at })
+    } catch (error) {
+      // A refused replacement leaves the history intact; the delivery proceeds rather than failing.
+      this.runtimeHealth.set({ state: 'error', detail: `orchestrator history replacement refused: ${String(error).slice(0, 200)}`, at })
+    }
   }
 
   readonly ready: Promise<void>
@@ -109,7 +109,7 @@ export class Runtime extends Service implements SourceHost {
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   private master = ''
   private rotating = false
-  /** The current orchestrator session, which is replaced once its prompt passes the limit. */
+  /** The orchestrator session id; its history is replaced in place once its prompt passes the limit. */
   get masterId(): string { return this.master }
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()

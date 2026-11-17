@@ -1,5 +1,6 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
 import type { Context } from '@deepseek-ai/cordis'
+import { foldSurface } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
@@ -29,7 +30,7 @@ export interface SessionsHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
-  /** The current orchestrator session; it changes when the session is replaced for context. */
+  /** The orchestrator session; its history is replaced in place when it grows too large. */
   masterId(): string
   /** Called before a delivery to the master, so the session can be replaced when its prompt has grown too large. */
   headroom?: () => Promise<void>
@@ -173,6 +174,35 @@ export class Sessions {
     if ('error' in result) throw result.error
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
   }
+  /**
+   * Replaces the orchestrator's visible history with `text`, in the same session.
+   *
+   * The session id, its log and its title stay, and the model's next request sees the system prompt followed by this text;
+   * the events it shadows remain in the log and readable. This is the same surface replacement compaction uses, with the
+   * handover built from the store instead of a model summary.
+   */
+  async replaceMasterHistory(text: string): Promise<boolean> {
+    const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId() as SessionId)
+    if ('error' in resolved) return false
+    const session = resolved.agent.session
+    const events = session.snapshotEvents()
+    const nodes = foldSurface(events).nodes
+    const bySeq = new Map(events.map(event => [event.seq, event]))
+    // Node 0 is the system prompt, and a user message may not shadow it: keep it and replace everything after it.
+    const head = nodes.findIndex(seq => bySeq.get(seq)?.type !== 'system/message')
+    if (head < 1 || head >= nodes.length) return false
+    const shadowed = nodes.slice(head)
+    const start = shadowed[0]!
+    const end = shadowed[shadowed.length - 1]!
+    session.append('user/message', {
+      id: messageId(key('handover', this.host.masterId())),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    }, { surfaceOp: { op: 'replace', startSeq: start, endSeq: end }, sourceEventSeqs: [...shadowed] })
+    return true
+  }
+
   /** The size of the prompt a session's last request sent: uncached input plus what the provider served from cache. */
   async promptSize(sessionId: string): Promise<number> {
     const resolved = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
