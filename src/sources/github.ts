@@ -287,11 +287,21 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
+  const began = Date.now()
+  // Where a round spends its time decides the detection latency, so each step is timed and reported.
+  let mark = Date.now()
+  const spent: string[] = []
+  const lap = (name: string) => { const now = Date.now(); spent.push(`${name} ${((now - mark) / 1000).toFixed(1)}s`); mark = now }
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
+  lap('notify')
   await pollRepository(ctx, round)
+  lap('streams')
   await pollTicketPulls(ctx, signal, round)
+  lap('pulls')
   await pollRequesterClosed(ctx, round)
+  lap('closed')
   await pollThreads(ctx, signal, round)
+  lap('threads')
   if ('error' in notified) throw notified.error
   const { count, interval } = notified.value
   if (signal?.aborted) return interval
@@ -300,7 +310,10 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const dropped = (round.dropped.length ? `; deleted on GitHub: ${named(round.dropped)}` : '')
     + (round.abandoned.length ? `; dropped after their reads kept failing: ${named(round.abandoned)}` : '')
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
-  ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
+  const took = ((Date.now() - began) / 1000).toFixed(1)
+  ctx.report('github', { state: 'ready',
+    detail: `${count} notifications in ${took}s (${spent.join(', ')}); next poll ≥ ${interval}s${dropped}`,
+    at: new Date().toISOString() })
   return interval
 }
 /** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
