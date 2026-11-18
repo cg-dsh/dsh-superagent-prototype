@@ -30,7 +30,7 @@ export async function pollThreads(ctx: SourceContext, source: string, stopped: (
   })
 }
 /** How many GitHub reads of one kind may run at once: enough to keep a round short, few enough to stay polite. */
-export const POLL_CONCURRENCY = 8
+export const POLL_CONCURRENCY = 4
 /** Runs `run` over `items` with at most `limit` in flight: a round of GitHub reads must fit in one poll interval. */
 export async function eachLimit<T>(items: readonly T[], limit: number, run: (item: T) => Promise<void>): Promise<void> {
   const queue = items.slice()

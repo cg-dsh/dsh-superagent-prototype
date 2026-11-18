@@ -142,6 +142,13 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       failures = 0
     } catch (error) {
       failures += 1
+      // A spent quota answers every read with 403; retrying on the poll interval only deepens it, so wait it out.
+      if (rateLimited(error)) {
+        if (!signal.aborted) ctx.report('github', health('paused', 'rateLimited'))
+        failures = 0
+        await pause(RATE_LIMIT_BACKOFF_MS, signal)
+        continue
+      }
       const failed = pollFailure(failures, config?.failuresBeforeError ?? 1, error)
       if (!signal.aborted && failed) ctx.report('github', failed)
     }
@@ -165,6 +172,12 @@ export interface Retry { since: string; pr: boolean; failedAt?: string; attempts
  * it. The window re-reads that few minutes; Trigger ids make a repeated read harmless. */
 const NOTIFICATION_LAG_MS = 10 * 60 * 1000
 const RETRY_WINDOW_MS = 24 * 3600_000
+/** How long a spent GitHub quota is left alone: the window is hourly, so ten quiet minutes clear a burst. */
+const RATE_LIMIT_BACKOFF_MS = 10 * 60_000
+/** True when GitHub refused the read because the hourly quota is spent. */
+function rateLimited(error: unknown): boolean {
+  return error instanceof CliError && error.code === 403 && /rate limit/i.test(error.message)
+}
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
 /** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
