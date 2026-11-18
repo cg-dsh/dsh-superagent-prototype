@@ -48,7 +48,8 @@ export const KV = {
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:'),
-    requesterClosed: family<string, [ticketId: string]>('github-requester-closed:') },
+    requesterClosed: family<string, [ticketId: string]>('github-requester-closed:'),
+    threadSweep: record<string>('github-thread-sweep') },
   /** One record per Ticket whose cleanup command ran, so it never runs twice. */
   cleanup: family<string, [ticketId: string]>('cleanup:'),
   /**

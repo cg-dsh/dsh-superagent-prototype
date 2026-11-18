@@ -23,6 +23,9 @@ const NotificationSchema = z.looseObject({
 })
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
+  /** How often the comment sweep re-reads subscribed threads; 0 does it every round. Notifications carry comments, so
+   * this is a reconciliation for what they missed, and reading 126 threads every round costs more than the quota allows. */
+  threadSweepSeconds: z.number().int().min(0).max(86_400).default(0),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   projectStatus: z.string().trim().max(40).default('test'),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
@@ -511,6 +514,14 @@ function nameThread(ctx: SourceContext, number: number, title: string): void {
 }
 /** Polls subscribed Issue and PR Threads not already read in this round; a deleted (410) Issue is still polled within the horizon (costing one read) and does not fail the round. */
 export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
+  // Comments arrive as notifications; re-reading every subscribed thread each round costs about 380 reads, more than the
+  // hourly quota allows. A configured interval turns this into a reconciliation for whatever the notifications missed.
+  const sweepSeconds = ctx.config<GithubConfig>(SOURCE)?.threadSweepSeconds ?? 0
+  if (sweepSeconds > 0) {
+    const last = ctx.state.get(KV.github.threadSweep)
+    if (last && Date.now() - Date.parse(last) < sweepSeconds * 1000) return
+    ctx.state.set(KV.github.threadSweep, round.started)
+  }
   await pollEach(ctx, SOURCE, () => stopped(ctx, round), async thread => {
     try { await pollThread(ctx, round, thread) }
     catch (error) {
