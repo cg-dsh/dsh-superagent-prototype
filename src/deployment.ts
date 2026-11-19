@@ -43,7 +43,10 @@ export function machineOf(config: DeploymentConfig): Machine {
 }
 
 export const GithubAccountsSchema = z.object({
+  /** The primary repository; its threads keep the bare number, so existing state stays valid. */
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
+  /** Further repositories the agent watches. Their threads are qualified as `owner/name#number`. */
+  repositories: z.array(z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'owner/name')).max(20).default([]),
   cli: z.string().trim().default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
@@ -51,7 +54,10 @@ export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
 
 export interface Deployment extends Machine {
+  /** The primary repository, whose threads keep the bare number. */
   repository: string
+  /** Every watched repository, the primary first; the same repo listed twice appears once. */
+  repositories: string[]
   github: { cli: string; login: string; noreply: string }
   feishu?: FeishuBot
 }
@@ -87,6 +93,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
 export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
+  if (accounts.repositories.length) throw new SetupError('repositoriesUnsupported')
   const remote = accounts.repository
   if (!remote) throw new SetupError('repositoryUnset')
   if (!accounts.cli) throw new SetupError('agentCliUnset')
@@ -102,7 +109,19 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  // Every further repository is checked the same way, so a typo or a missing permission fails setup rather than a launch.
+  const repositories = [repository]
+  for (const wanted of accounts.repositories) {
+    if (repositories.some(name => name.toLowerCase() === wanted.toLowerCase())) continue
+    const read = parsed(RepositoryAccess, await probe([cli, 'api', `repos/${wanted}`, '--jq', '{name: .full_name, push: .permissions.push}']).catch((error: unknown) => {
+      throw new SetupError('repositoryUnreadable', { account: agent.login, repository: wanted, output: reason(error) })
+    }))
+    if (!read) throw new SetupError('repositoryUnreported', { repository: wanted })
+    if (read.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository: read.name })
+    if (repositories.some(name => name.toLowerCase() === read.name.toLowerCase())) continue
+    repositories.push(read.name)
+  }
+  return { ...machine, repository, repositories, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })
