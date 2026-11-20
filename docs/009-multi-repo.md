@@ -27,6 +27,17 @@ every caller of `api`, `gh` and `pages` that can touch more than the primary mus
 signatures sit on top of, and why a partial change is not safe: a read that silently goes to the wrong repository either
 finds nothing or finds a same-numbered Issue that belongs to someone else.
 
+## One notification read, per-repository watchers for the rest
+
+The notifications endpoint is account-wide and cannot be filtered to a repository, so it is read **once** per round by a
+single loop; each notification is dispatched to the watcher of its own repository (`notification.repository.full_name`,
+checked against `deployment.repositories`). Everything repository-scoped — pull requests and their checks, Issue state,
+the comment sweep, the observed streams — runs in one watcher per repository, each with its own scoped commands, its own
+round and its own cursor.
+
+That keeps the call volume at one notification read plus the repo-scoped work, and still gives each repository an
+independent view of what it owes.
+
 ## Remaining: thread the repository through five functions
 
 | function | where the repository comes from |
