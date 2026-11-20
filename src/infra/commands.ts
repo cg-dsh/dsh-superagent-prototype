@@ -61,10 +61,16 @@ export class Commands {
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
    */
-  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
+  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>,
+    private readonly signal: AbortSignal, private readonly scope?: string) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
-  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  /** The repository every call resolves under: the one this instance is scoped to, or the deployment's primary. */
+  get repository(): string { return this.scope ?? this.deployment.repository }
+  withSignal(signal?: AbortSignal): Commands {
+    return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal]), this.scope) : this
+  }
+  /** The same CLI, commands and credentials, resolving every path under `repository` instead of the primary one. */
+  for(repository: string): Commands { return new Commands(this.resolved, this.environment, this.signal, repository) }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,

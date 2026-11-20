@@ -30,6 +30,8 @@ export interface SourceHost {
 export interface ThreadDescription { label?: string; url?: string; facts?: Record<string, ThreadFact | null> }
 /** Application capabilities exposed to a Source kind for reading state, ingesting triggers, managing threads/tickets, and reporting health. */
 export interface SourceContext {
+  /** The repository this watcher reads; the primary one until a Source watches several. */
+  readonly repository: string
   readonly deployment: Deployment
   readonly commands: Commands
   readonly ready: Promise<void>
