@@ -97,10 +97,31 @@ export class Commands {
     const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.path(path), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
   }
+  /**
+   * Calls an account-level GitHub API path, one that is not under a repository (the notifications list).
+   * @throws CliError with GitHub's HTTP status as `code` on failure.
+   */
+  async account<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async account(path: string, ...flags: string[]): Promise<string>
+  async account<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.relative(schema, 'the account'), ...rest])
+    const [path = '', ...flags] = rest
+    return schema.parse(await this.gh(['api', this.relative(path, 'the account'), ...flags]))
+  }
+  /** Fetches all pages of an account-level GitHub API list, skipping items that fail schema validation. */
+  async accountPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.relative(path, 'the account'), '--paginate', '--slurp']))
+    return validItems(item, pages.flat(), tally)
+  }
   private path(path: string): string {
+    const relative = this.relative(path, 'the configured repository')
+    return relative ? `repos/${this.repository}/${relative}` : `repos/${this.repository}`
+  }
+  /** Rejects a path that leaves the GitHub API or traverses, without naming arguments that may carry message text. */
+  private relative(path: string, subject: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
-    if (outside) throw new Error('GitHub calls are restricted to the configured repository')
-    return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+    if (outside) throw new Error(`GitHub calls are restricted to ${subject}`)
+    return path
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

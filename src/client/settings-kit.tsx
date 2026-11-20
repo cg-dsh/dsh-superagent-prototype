@@ -264,6 +264,11 @@ export function SourceField({ field, value, saved, fact, onChange, labels, refre
         : <Input value={String(value ?? '')} readOnly={field.readonly} pattern={field.pattern} spellCheck={false}
           onChange={event => onChange(event.target.value)} />}
     </Field>
+    case 'lines': return <Field label={label} hint={hint}>
+      <textarea className="dt-textarea dt-mono" rows={field.rows ?? 3} spellCheck={false}
+        value={(Array.isArray(value) ? value as string[] : []).join('\n')}
+        onChange={event => onChange(event.target.value.split('\n').map(line => line.trim()).filter(Boolean))} />
+    </Field>
     case 'fact': return <div className="dt-field">
       <span className="dt-field-head">{label}{hint && <InfoTip text={hint} />}</span>
       <span className="dt-mono">{localized(t, fact) || t('empty')}</span>

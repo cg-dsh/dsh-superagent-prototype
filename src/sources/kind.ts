@@ -18,6 +18,8 @@ export type FieldSpec =
   | FieldBase & { type: 'select'; options: { value: string; label: Localized }[] }
   | FieldBase & { type: 'number'; min: number; max: number }
   | FieldBase & { type: 'text'; pattern?: string; readonly?: boolean; choose?: Localized }
+  /** A textarea holding one value per line, such as a list of repositories. */
+  | FieldBase & { type: 'lines'; rows?: number }
   | FieldBase & { type: 'fact'; settings?: 'deployment' }
   | FieldBase & { type: 'rows'; columns: ({ key: string; label: Localized; type: 'text'; pattern?: string; optional?: boolean; choose?: Localized; refresh?: Localized } | { key: string; label: Localized; type: 'select'; options: { value: string; label: Localized }[] })[] }
 

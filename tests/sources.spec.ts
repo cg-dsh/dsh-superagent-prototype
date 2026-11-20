@@ -648,7 +648,8 @@ describe('github source', () => {
       return JSON.stringify(args.includes('--slurp') ? [[]] : [])
     })
     expect(await pollRound(h)).toBe(120)
-    const notifications = calls.filter(args => args[1]!.includes('/notifications'))
+    // Notifications are the account's, so the path names no repository.
+    const notifications = calls.filter(args => args[1]!.startsWith('notifications'))
     expect(notifications.map(args => args.includes('--paginate'))).toEqual([false, true])
     const paths = calls.map(args => args[1]!.split('?')[0])
     expect(paths).toEqual(expect.arrayContaining(['repos/acme/widgets/issues/12', 'repos/acme/widgets/issues/13']))
@@ -1019,6 +1020,108 @@ describe('source context', () => {
     h.store.close()
   })
 })
+describe('watching more than one GitHub repository', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+  const deploymentOf = () => testDeployment({ repositories: ['acme/widgets', 'acme/gadgets'] })
+  /** Stubs `gh api` for several repositories, keyed by the full path `gh` receives; returns every requested path. */
+  function requests(routes: Record<string, unknown>): string[] {
+    const calls: string[] = []
+    vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!
+      calls.push(path)
+      const route = routes[path.split('?')[0]!]
+      const value: unknown = typeof route === 'function' ? (route as () => unknown)()
+        : route ?? (args.includes('--slurp') ? [] : refused(404, 'Not Found'))
+      if (value instanceof Error) throw value
+      if (args.includes('--include')) return `HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\n\r\n${JSON.stringify(value)}`
+      return JSON.stringify(args.includes('--slurp') ? [value] : value)
+    })
+    return calls
+  }
+  const mention = (repository: string) => ({ id: `n-${repository}`, updated_at: '2026-09-09T00:00:00Z', reason: 'mention',
+    repository: { full_name: repository }, subject: { url: `https://api.github.com/repos/${repository}/issues/12`, type: 'Issue', title: 'Login fails' } })
+  const opened = (repository: string) => ({ id: 1012, number: 12, title: 'Login fails', body: 'details', state: 'open',
+    created_at: '2026-09-09T00:00:00Z', html_url: `https://github.com/${repository}/issues/12`, user: { login: 'alice', type: 'User' } })
+
+  it('reads the account\'s notifications once and names each watched repository\'s thread by it', async () => {
+    const h = host({ deployment: deploymentOf() })
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    const reads = requests({ notifications: [mention('acme/widgets'), mention('acme/gadgets'), mention('acme/other')],
+      'repos/acme/widgets/issues/12': opened('acme/widgets'), 'repos/acme/gadgets/issues/12': opened('acme/gadgets'),
+      'repos/acme/other/issues/12': opened('acme/other') })
+    await pollRound(h)
+    // The account's notifications are read once; a repository the Source does not watch is not read at all.
+    expect(reads.filter(path => path.startsWith('notifications'))).toHaveLength(1)
+    expect(reads).not.toContain('repos/acme/other/issues/12')
+    const taken = h.receive.mock.calls.map(([trigger]) => trigger)
+    expect(taken.map(trigger => trigger.threads[0]!.id).sort()).toEqual(['12', 'acme/gadgets#12'])
+    expect(taken.map(trigger => trigger.channel!.thread).sort()).toEqual(['github:12', 'github:acme/gadgets#12'])
+    // The Issue's id follows its thread, so the same number in two repositories is two Triggers.
+    expect(taken.map(trigger => trigger.id).sort()).toEqual([key('github-issue', '12'), key('github-issue', 'acme/gadgets#12')].sort())
+    // Everything a notification made the Source read went through its own repository.
+    expect(reads).toEqual(expect.arrayContaining(['repos/acme/widgets/issues/12', 'repos/acme/gadgets/issues/12']))
+    expect(h.store.get('github-cursor:12')).toBeDefined()
+    expect(h.store.get('github-cursor:acme/gadgets#12')).toBeDefined()
+    h.store.close()
+  })
+
+  it('reads each repository\'s observed streams and default-branch CI under its own cursors', async () => {
+    const h = host({ deployment: deploymentOf() })
+    h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources,
+      github: { enabled: true, config: { repository: 'acme/widgets', repositories: ['acme/gadgets'], observeIssues: true, observeCi: true } } } })
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    const started = new Date(Date.now() - 2 * 3600_000).toISOString()
+    const created = new Date(Date.now() - 3600_000).toISOString()
+    for (const name of ['issues', 'acme/gadgets:issues']) h.store.set(`github-stream:${name}`, { since: started, started: { issues: started } })
+    const issue = { ...opened('acme/gadgets'), created_at: created, updated_at: created }
+    requests({ notifications: [], 'repos/acme/widgets/issues': [], 'repos/acme/gadgets/issues': [issue],
+      'repos/acme/widgets': { default_branch: 'main' }, 'repos/acme/gadgets': { default_branch: 'trunk' },
+      'repos/acme/widgets/commits/main': { sha: 'w1' }, 'repos/acme/gadgets/commits/trunk': { sha: 'g1' },
+      'repos/acme/widgets/commits/w1/check-runs': { check_runs: [] }, 'repos/acme/gadgets/commits/g1/check-runs': { check_runs: [] } })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.threads[0]!.id)).toEqual(['acme/gadgets#12'])
+    // Each repository keeps its own stream cursor and its own default-branch CI baseline.
+    expect(h.store.get<{ since: string }>('github-stream:acme/gadgets:issues')!.since).toBe(cursorAt(created))
+    expect(h.store.get<{ since: string }>('github-stream:issues')!.since).toBe(started)
+    expect(h.store.get('github-branch-ci')).toMatchObject({ branch: 'main' })
+    expect(h.store.get('github-branch-ci:acme/gadgets')).toMatchObject({ branch: 'trunk' })
+    h.store.close()
+  })
+
+  it('binds a pull request to a qualified thread in a second repository, and to the bare one in the primary', () => {
+    const h = host({ deployment: deploymentOf() })
+    const context = h.context(githubKind)
+    const gadgets = context.scope!('acme/gadgets')
+    expect(gadgets.repository).toBe('acme/gadgets')
+    expect(gadgets.commands.repository).toBe('acme/gadgets')
+    // The primary repository keeps the very command layer the fixture provided, so nothing about it changed.
+    expect(context.scope!('acme/widgets').commands).toBe(h.commands)
+    h.store.tickets.save({ ...openTicket('t1'), execution: execution('fix-1') })
+    h.store.tickets.save({ ...openTicket('t2'), execution: execution('fix-2') })
+    const agentPullIn = (number: number, repository: string): Pull => ({ ...agentsPull(number, 'agent/fix-1'),
+      head: { sha: 'abc', ref: 'agent/fix-1', repo: { full_name: repository } } })
+    expect(claimPull(gadgets, 't1', agentPullIn(43, 'acme/gadgets'))).toBeUndefined()
+    expect(h.store.tickets.get('t1')!.follows).toEqual([{ thread: 'github:acme/gadgets#43', own: true }])
+    expect(h.store.threads.get('github:acme/gadgets#43')?.subscriptions).toEqual(['t1'])
+    expect(claimPull(context, 't2', { ...agentsPull(44, 'agent/fix-2'), head: { sha: 'abc', ref: 'agent/fix-2',
+      repo: { full_name: 'acme/widgets' } } })).toBeUndefined()
+    expect(h.store.tickets.get('t2')!.follows).toEqual([{ thread: 'github:44', own: true }])
+    h.store.close()
+  })
+
+  it('tells a Ticket its own repository in the execution environment, and the primary one when it did not start on GitHub', () => {
+    const deployment = deploymentOf()
+    const config = githubKind.schema.parse({})
+    const values = (trigger?: Trigger) => githubKind.environment!.values({ deployment, config, ...trigger ? { trigger } : {} })
+    const github: Trigger = { id: 't', source: 'github', threads: [{ source: 'github', id: 'acme/gadgets#14' }],
+      actor: { source: 'github', id: 'alice' }, human: true, at: '', text: '', meta: { number: 14 } }
+    expect(values(github).DSH_SUPERAGENT_GITHUB_REPOSITORY).toBe('acme/gadgets')
+    expect(values({ ...github, source: 'feishu', threads: [{ source: 'feishu', id: 'oc_1:om_1' }] }).DSH_SUPERAGENT_GITHUB_REPOSITORY)
+      .toBe('acme/widgets')
+    expect(values().DSH_SUPERAGENT_GITHUB_REPOSITORY).toBe('acme/widgets')
+  })
+})
+
 it('reports GitHub as failing only after the configured number of consecutive failed polls', () => {
   const eof = new Error('Get "https://api.github.com/x": EOF')
   expect(pollFailure(1, 3, eof)).toBeUndefined()

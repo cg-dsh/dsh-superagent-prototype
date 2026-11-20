@@ -99,7 +99,7 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   const github = all('.dt-card')[1]!
   expect(github.textContent).toContain('当前账号 @agent-bot')
   const labels = () => [...github.querySelectorAll('label')].map(label => label.textContent)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI'])
+  expect(labels()).toEqual(['监听的仓库', '同时监听的仓库', '智能体的 GitHub CLI'])
   expect(field<HTMLInputElement>('监听的仓库').value).toBe('acme/widgets')
   // A fact describes the saved value, so an edited CLI shows none until it is saved.
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), 'gh-other')
@@ -107,7 +107,7 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   await click(zh.discard)
   expect(github.textContent).toContain('当前账号 @agent-bot')
   await click([...github.querySelectorAll<HTMLElement>('[data-disclosure-row]')].find(row => row.textContent?.includes('高级'))!)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI', '轮询间隔 / 秒', '连续失败几次后报告异常', '合并后移动到的项目状态'])
+  expect(labels()).toEqual(['监听的仓库', '同时监听的仓库', '智能体的 GitHub CLI', '轮询间隔 / 秒', '连续失败几次后报告异常', '合并后移动到的项目状态'])
   expect(all('.dt-card')[0]!.textContent).toContain('当前机器人 Widgets Bot')
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), '/opt/bin/gh-agent')
   expect(github.textContent).toContain('保存会重启 dsh-superagent：2 个进行中的派工会中断，并带恢复说明重新开始。')
@@ -215,6 +215,21 @@ it('shows a refused Source save with the output of the tool that failed on its o
   await type(field<HTMLInputElement>('机器人的 lark-cli'), 'lark-broken')
   await act(async () => { feishu.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
   expect(feishu.querySelector('.dt-savebar [role="alert"]')?.textContent).toBe('机器人的 lark-cli 不可用。\nlark-cli: app secret missing')
+})
+
+it('edits the repositories the GitHub Source also watches, one owner/name per line', async () => {
+  server.settings.sources.github = { ...server.settings.sources.github!, config: { ...server.settings.sources.github!.config,
+    repositories: ['acme/widgets'] } }
+  await mount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const github = all('.dt-card')[1]!
+  const list = field<HTMLTextAreaElement>('同时监听的仓库')
+  expect(list.value).toBe('acme/widgets')
+  // Blank lines and surrounding spaces are dropped, so the schema receives the list of repositories it expects.
+  await type(list, 'acme/gadgets\n\n  acme/extra  ')
+  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(server.settings.sources.github!.config.repositories).toEqual(['acme/gadgets', 'acme/extra'])
 })
 
 it('shows a setup problem on its Source card within one read of the settings, which the settings groups share', async () => {

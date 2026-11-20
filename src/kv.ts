@@ -46,10 +46,15 @@ export const KV = {
   github: { since: record<string>('github-since'), retries: record<Record<string, Retry>>('github-retry'),
     cursor: family<string, [thread: string]>('github-cursor:'),
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
-    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
-    ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:'),
+    /** The default branch's CI baseline; the primary repository's key stays `github-branch-ci`. */
+    branchCi: family<{ branch?: string; failures?: string[]; revision: number }, [repository: string, primary: string]>('github-branch-ci',
+      (repository, primary) => repository.trim().toLowerCase() === primary.trim().toLowerCase() ? '' : `:${repository}`),
+    /** A pull request's CI baseline, by the pull request's thread id, which names its repository when it is not the primary. */
+    ci: family<{ fingerprint: string; revision: number }, [thread: string]>('github-ci:'),
     requesterClosed: family<string, [ticketId: string]>('github-requester-closed:'),
-    threadSweep: record<string>('github-thread-sweep') },
+    /** When the comment sweep last ran; the primary repository keeps the `github-thread-sweep` key. */
+    threadSweep: family<string, [repository: string, primary: string]>('github-thread-sweep',
+      (repository, primary) => repository.trim().toLowerCase() === primary.trim().toLowerCase() ? '' : `:${repository}`) },
   /** One record per Ticket whose cleanup command ran, so it never runs twice. */
   cleanup: family<string, [ticketId: string]>('cleanup:'),
   /**
