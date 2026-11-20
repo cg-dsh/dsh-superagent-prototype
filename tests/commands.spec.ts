@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
@@ -9,6 +9,7 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+afterEach(() => vi.restoreAllMocks())
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
@@ -46,6 +47,18 @@ describe('account-isolated operations', () => {
     expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\n<!-- dsh-superagent:stable-operation -->$/)])
     await expect(new Commands(() => deployment, {}, new AbortController().signal).pages(z.unknown(),
       '../../someone/else/issues')).rejects.toThrow()
+  })
+  it('posts a reply to the repository its thread names, never the primary', async () => {
+    const commands = new Commands(() => testDeployment({ repository: 'acme/widgets', repositories: ['acme/widgets', 'acme/other'] }),
+      {}, new AbortController().signal)
+    const paths: string[] = []
+    vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+      paths.push(args[1]!)
+      return args.includes('--slurp') ? '[[]]' : '{}'
+    })
+    await send(commands, { ...reply, channel: githubChannel(8, 'https://github.com/acme/other/issues/8#issuecomment-1', 'acme/other#8') })
+    expect(paths).toEqual(expect.arrayContaining(['repos/acme/other/issues/8/comments']))
+    expect(paths.some(path => path.startsWith('repos/acme/widgets/'))).toBe(false)
   })
   it('routes review-comment replies to the root review comment', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
