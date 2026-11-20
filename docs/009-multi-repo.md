@@ -38,6 +38,18 @@ round and its own cursor.
 That keeps the call volume at one notification read plus the repo-scoped work, and still gives each repository an
 independent view of what it owes.
 
+## The scoped context must be injected, not built inside the poller
+
+Attempting the per-repository loop from inside the poller failed on the source's own tests, and the failure is
+informative: a scoped `Commands` constructed by the source (`ctx.commands.for(repository)`) is not the command layer the
+tests replace, so one test ended up executing the fixture's `/bin/false` CLI for real ("false exited with code 1"). The
+same applies to the context: fixtures build one directly, so a context manufactured inside the poller bypasses whatever
+those fixtures provide.
+
+So the registry, not the poller, owns the scoping: `applyGithub` receives (or the context exposes) a
+`scope(repository): SourceContext` whose `commands` and `repository` are supplied by the factory, and the poller only
+calls it. A fixture can then supply its own scoped view and the tests keep control of the command layer.
+
 ## Remaining: thread the repository through five functions
 
 | function | where the repository comes from |
