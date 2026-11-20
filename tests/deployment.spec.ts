@@ -13,6 +13,10 @@ let path: string
 const program = (file: string, body = ''): string => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file }
 /** Fake gh CLI signed in as `login` with configurable push access to acme/widgets (including its former name acme/gadgets). */
 const gh = (file: string, login: string, push = true): string => program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`)
+/** Fake gh CLI answering a canonical name and push access per requested repository. */
+const multiGh = (file: string, login: string, repositories: Record<string, { name: string; push?: boolean }>): string =>
+  program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n${Object.entries(repositories).map(([asked, access]) =>
+    `  "api repos/${asked} --jq {name: .full_name, push: .permissions.push}") echo '{"name":"${access.name}","push":${access.push ?? true}}' ;;`).join('\n')}\n  *) exit 1 ;;\nesac`)
 /** Fake lark-cli script body returning canned auth, strict-mode, and bot info responses. */
 const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string =>
   `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
@@ -64,6 +68,16 @@ describe('setup', () => {
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
     expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+  })
+  it('accepts further repositories, canonicalises each and lists each once', async () => {
+    const cli = multiGh(join(dir, 'bin', 'gh-multi'), 'Agent-Bot', {
+      'acme/widgets': { name: 'acme/widgets' }, 'Acme/Gadgets': { name: 'acme/gadgets' },
+    })
+    const deployment = await resolveDeployment(machine(),
+      { repository: 'acme/widgets', repositories: ['Acme/Gadgets', 'acme/widgets', 'acme/gadgets'], cli }, probe, path)
+    // The primary stays first; each further repository is stored under the name GitHub reports, once.
+    expect(deployment.repository).toBe('acme/widgets')
+    expect(deployment.repositories).toEqual(['acme/widgets', 'acme/gadgets'])
   })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>

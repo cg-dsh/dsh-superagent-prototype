@@ -93,7 +93,6 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
 export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
-  if (accounts.repositories.length) throw new SetupError('repositoriesUnsupported')
   const remote = accounts.repository
   if (!remote) throw new SetupError('repositoryUnset')
   if (!accounts.cli) throw new SetupError('agentCliUnset')
