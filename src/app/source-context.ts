@@ -24,51 +24,66 @@ export interface SourceContextDeps {
   readonly feishuProblem?: SetupProblem | undefined
   /** Hands a Trigger to the Engine and schedules the pass that assesses it. */
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
+  /** Builds another repository's context; the factory supplies its commands and repository, so fixtures keep control. */
+  readonly scope?: ((repository: string) => SourceContext) | undefined
 }
 
 /**
  * Builds the context for one Source kind. Health reports are restricted to entries declared by the kind and
  * bound to the active registration, becoming no-ops once unregistered.
+ *
+ * The returned context can build one per repository. That scoping is supplied here, by the factory that owns this
+ * context, rather than by a Source: a context the poller made for itself would bypass the command layer a fixture
+ * provides. The primary repository's context keeps the very commands it was given, so a single-repository Source
+ * reads exactly what it read before.
  */
 export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; health: readonly string[] }): SourceContext {
   const { store } = deps
   const health = deps.sources.healthEntries(kind.health)
-  return {
-    get deployment() { return deps.deployment },
-    get repository() { return deps.deployment.repository },
-    commands: deps.commands,
-    ready: deps.ready,
-    configured: () => deps.configured(),
-    get problem() { return [deps.feishuProblem, deps.setupProblem].find(problem => problem?.place === kind.kind) },
-    config: <C extends Record<string, unknown>>(id: string) => {
-      const instance = deps.sources.instance<C>(id)
-      return instance?.enabled ? instance.config : undefined
-    },
-    receive: trigger => deps.receive(trigger),
-    atomic: work => store.atomic(work),
-    state: {
-      get: name => store.get(name),
-      set: (name, value) => { if (value === undefined) store.delete(name); else store.set(name, value) },
-      keys: prefix => store.keys(prefix),
-    },
-    threads: {
-      get: key => store.threads.get(key),
-      subscribed: source => store.read.subscribedThreads(source),
-      describe: (key, description) => store.threads.describe(key, description),
-      patch: (key, meta) => { store.threads.patchMeta(key, meta) },
-    },
-    tickets: {
-      get: id => store.tickets.get(id),
-      open: () => store.tickets.open(),
-      bindThread: (id, thread, own) => { deps.engine.bindThread(id, thread, own) },
-      threadClosed: (thread, outcome, at) => { deps.engine.threadClosed(thread, outcome, at) },
-      requesterClosed: (id, at) => { deps.engine.requesterClosed(id, at) },
-    },
-    triggers: { get: id => store.triggers.get(id), latest: thread => store.read.threadTriggers(thread, 1)[0] },
-    notify: message => { deps.outbox.send(message) },
-    report: (entry, value) => {
-      if (!kind.health.includes(entry)) throw new Error(`The ${kind.kind} Source has no health entry ${entry}`)
-      health.get(entry)?.set(value)
-    },
+  /** True for the primary repository, whose context already carries the deployment's commands. */
+  const primary = (repository: string): boolean => repository.trim().toLowerCase() === deps.deployment.repository.trim().toLowerCase()
+  /** The context of one repository, or the primary one when no repository is scoped. */
+  const build = (repository?: string): SourceContext => {
+    const commands = !repository || primary(repository) ? deps.commands : deps.commands.for(repository)
+    return {
+      get deployment() { return deps.deployment },
+      get repository() { return repository ?? deps.deployment.repository },
+      get commands() { return commands },
+      ready: deps.ready,
+      configured: () => deps.configured(),
+      get problem() { return [deps.feishuProblem, deps.setupProblem].find(problem => problem?.place === kind.kind) },
+      config: <C extends Record<string, unknown>>(id: string) => {
+        const instance = deps.sources.instance<C>(id)
+        return instance?.enabled ? instance.config : undefined
+      },
+      receive: trigger => deps.receive(trigger),
+      atomic: work => store.atomic(work),
+      state: {
+        get: name => store.get(name),
+        set: (name, value) => { if (value === undefined) store.delete(name); else store.set(name, value) },
+        keys: prefix => store.keys(prefix),
+      },
+      threads: {
+        get: key => store.threads.get(key),
+        subscribed: source => store.read.subscribedThreads(source),
+        describe: (key, description) => store.threads.describe(key, description),
+        patch: (key, meta) => { store.threads.patchMeta(key, meta) },
+      },
+      tickets: {
+        get: id => store.tickets.get(id),
+        open: () => store.tickets.open(),
+        bindThread: (id, thread, own) => { deps.engine.bindThread(id, thread, own) },
+        threadClosed: (thread, outcome, at) => { deps.engine.threadClosed(thread, outcome, at) },
+        requesterClosed: (id, at) => { deps.engine.requesterClosed(id, at) },
+      },
+      triggers: { get: id => store.triggers.get(id), latest: thread => store.read.threadTriggers(thread, 1)[0] },
+      notify: message => { deps.outbox.send(message) },
+      report: (entry, value) => {
+        if (!kind.health.includes(entry)) throw new Error(`The ${kind.kind} Source has no health entry ${entry}`)
+        health.get(entry)?.set(value)
+      },
+      scope: deps.scope ?? (target => build(target)),
+    }
   }
+  return build()
 }

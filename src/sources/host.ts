@@ -30,10 +30,15 @@ export interface SourceHost {
 export interface ThreadDescription { label?: string; url?: string; facts?: Record<string, ThreadFact | null> }
 /** Application capabilities exposed to a Source kind for reading state, ingesting triggers, managing threads/tickets, and reporting health. */
 export interface SourceContext {
-  /** The repository this watcher reads; the primary one until a Source watches several. */
+  /** The repository this context reads: the primary one for the Source's own context, another one for a scoped context. */
   readonly repository: string
   readonly deployment: Deployment
   readonly commands: Commands
+  /**
+   * The same context reading another repository, with its `commands` and `repository` supplied by the factory that built
+   * this context; Sources poll each repository through it. Fixtures may omit it, and the poller then uses this context.
+   */
+  scope?(repository: string): SourceContext
   readonly ready: Promise<void>
   /** True once setup resolved the repository and accounts; Sources poll only then. */
   configured(): boolean
