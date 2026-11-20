@@ -13,8 +13,10 @@ export interface SetupHost {
   restart(): void
 }
 
+/** A setup-read value as it is compared: an absent value and an empty list are the same (no repositories named). */
+const setupValue = (value: unknown): unknown => value === undefined || Array.isArray(value) && value.length === 0 ? '' : value
 const setupFields = (settings: Settings) =>
-  JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
+  JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => setupValue(settings.sources[id]?.config[key]))))
 export const setupChanged = (before: Settings, after: Settings): boolean => setupFields(before) !== setupFields(after)
 
 /**
