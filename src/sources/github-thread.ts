@@ -27,3 +27,15 @@ export function threadRepository(id: string, primary: string): string {
 export function sameRepository(left: string, right: string): boolean {
   return left.trim().toLowerCase() === right.trim().toLowerCase()
 }
+
+/** The id of the default branch's CI thread, bare for the primary repository and qualified otherwise. */
+export function branchCiThreadId(branch: string, repository: string, primary: string): string {
+  return sameRepository(repository, primary) ? `ci:${branch}` : `ci:${repository}#${branch}`
+}
+
+/** The Issue or PR number a follow thread names (`github:14` or `github:owner/name#14`), or undefined for another source. */
+export function pullNumberFromThread(thread: string, source = 'github'): number | undefined {
+  if (!thread.startsWith(`${source}:`)) return undefined
+  const number = threadNumber(thread.slice(source.length + 1))
+  return Number.isFinite(number) && number > 0 ? number : undefined
+}
