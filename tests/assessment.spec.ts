@@ -13,31 +13,39 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 
 /** Assessor fixture backed by in-memory repositories and fake GitHub Issue and file reads. */
 function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.from({ length: 5 }, (_, i) => `comment ${i}`),
-  threadContext?: AssessorHost['threadContext']) {
+  threadContext?: AssessorHost['threadContext'], deployment = testDeployment()) {
   const comments = bodies.map((body, i) => ({ id: i, html_url: `https://github.com/acme/widgets/issues/1#c${i}`,
     user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', body }))
   const gate = { issue: undefined as Promise<void> | undefined }
-  const commands = {
-    repository: 'acme/widgets', deployment: testDeployment(),
-    withSignal() { return commands },
-    gh: vi.fn(async (args: string[]) => {
-      await gate.issue
-      const number = Number(/issues\/(\d+)/.exec(args[1]!)?.[1])
-      return args[1]!.includes('/comments') ? comments : { id: 100 + number, number, state: 'open',
-        html_url: `https://github.com/acme/widgets/issues/${number}`,
-        user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', title: 'Issue', body: 'body' }
-    }),
-    run: vi.fn(async () => 'export const value = 1\n'),
-    // A string first argument is a raw file path; otherwise validate the fake gh response against the schema.
-    api: vi.fn(async (schema: unknown, ...rest: string[]) => typeof schema === 'string' ? 'export const value = 1\n'
-      : (schema as { parse(value: unknown): unknown }).parse(await (commands as unknown as { gh(args: string[]): Promise<unknown> }).gh(['api', rest[0]!]))),
-  } as unknown as Commands
+  /** Every `api` call a command layer of `repository` makes, as `owner/name:path`. */
+  const files: string[] = []
+  const gh = vi.fn(async (args: string[]) => {
+    await gate.issue
+    const number = Number(/issues\/(\d+)/.exec(args[1]!)?.[1])
+    return args[1]!.includes('/comments') ? comments : { id: 100 + number, number, state: 'open',
+      html_url: `https://github.com/acme/widgets/issues/${number}`,
+      user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', title: 'Issue', body: 'body' }
+  })
+  const scoped = (repository: string): Commands => {
+    const layer = { repository, deployment, withSignal: () => layer, gh,
+      run: vi.fn(async () => 'export const value = 1\n'),
+      // A string first argument is a raw file path; otherwise validate the fake gh response against the schema.
+      api: vi.fn(async (schema: unknown, ...rest: string[]) => {
+        // The raw overload takes the path first; the schema overload takes it after the schema.
+        const path = typeof schema === 'string' ? schema : rest[0]!
+        files.push(`${repository}:${path}`)
+        return typeof schema === 'string' ? 'export const value = 1\n'
+          : (schema as { parse(value: unknown): unknown }).parse(await gh(['api', path]))
+      }), for: (next: string) => scoped(next) } as unknown as Commands
+    return layer
+  }
+  const commands = scoped('acme/widgets')
   const repo = new MemoryRepositories()
   const sources = new SourceRegistry(() => SettingsSchema.parse({}))
   sources.register(githubKind)
   let engine!: Engine
   const host: AssessorHost = {
-    get engine() { return engine }, commands, deployment: testDeployment(), settings: () => SettingsSchema.parse({}),
+    get engine() { return engine }, commands, deployment, settings: () => SettingsSchema.parse({}),
     threadContext: threadContext ?? (trigger => sources.threadContext(trigger)),
     effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async candidate => ({ eval_id: candidate.evalId }),
   }
@@ -57,7 +65,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   // Per-Eval state retained by the assessor and released when the Eval ends.
   const kept = assessor as unknown as { evals: Map<string, unknown> }
   const size = () => kept.evals.size
-  return { repo, engine, assessor, tools, size, gate }
+  return { repo, engine, assessor, tools, size, gate, files }
 }
 const issue = (n: number): Trigger => ({ id: `issue-${n}`, source: 'github', threads: [{ source: 'github', id: String(n) }], actor: { source: 'github', id: 'bob' }, human: true,
   at: new Date(Date.UTC(2026, 8, 9, 0, 0, n)).toISOString(), text: `issue ${n}`, url: `https://github.com/acme/widgets/issues/${n}`, meta: { number: n } })
@@ -111,6 +119,17 @@ it('reads the context of a Trigger through its Source, and none for a Source tha
   expect(await s.tools.orchestrator_eval_read!({ trigger_id: 'other-2', resource: 'message', offset: 0 },
     signal)).toMatchObject({ text: 'issue 2' })
 })
+it('reads a qualified candidate\'s repository files from its own repository, never the primary', async () => {
+  const s = setup('inferred', undefined, undefined,
+    testDeployment({ repository: 'acme/widgets', repositories: ['acme/widgets', 'acme/other'] }))
+  const qualified: Trigger = { ...issue(9), id: 'other-9', threads: [{ source: 'github', id: 'acme/other#9' }],
+    url: 'https://github.com/acme/other/issues/9' }
+  s.engine.receive(qualified); s.engine.evaluateDue()
+  await s.tools.orchestrator_eval_read!({ trigger_id: 'other-9', resource: 'file', path: 'src/value.ts', offset: 0 }, signal)
+  expect(s.files).toContain('acme/other:contents/src/value.ts')
+  expect(s.files.some(path => path.startsWith('acme/widgets:'))).toBe(false)
+})
+
 it('routes an explicit candidate instead of assessing it: each eval tool names the routing tools', async () => {
   const s = setup('explicit')
   s.engine.receive(issue(1)); s.engine.evaluateDue()

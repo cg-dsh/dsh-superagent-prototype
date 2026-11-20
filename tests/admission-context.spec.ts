@@ -1,13 +1,15 @@
-import { expect, it, vi } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { admissionContext, threadWindow } from '../src/sources/admission-context.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
+import { githubKind } from '../src/sources/github.ts'
 import type { ContextMessage } from '../src/sources/kind.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import type { Trigger } from '../src/core/index.ts'
 const message = (index: number): ContextMessage => ({ id: `om_${index}`, from: 'ou_user', at: String(index), text: `Message ${index}` })
+afterEach(() => vi.restoreAllMocks())
 /** The same message as a Feishu topic page lists it. */
 const listed = (index: number) => ({ message_id: `om_${index}`, chat_id: 'oc_chat', content: `Message ${index}`, msg_type: 'text',
   sender: { id: 'ou_user', sender_type: 'user' }, create_time: String(index) })
@@ -35,6 +37,34 @@ it('retains pagination limits and exact loaded counts rather than claiming compl
   expect(lark).toHaveBeenCalledTimes(2)
   expect(lark.mock.calls[1]![0]).toEqual(expect.arrayContaining(['--page-size', '2']))
 })
+it('assembles a qualified GitHub Issue thread in its own repository and finds its source', async () => {
+  const deployment = testDeployment({ repository: 'acme/widgets', repositories: ['acme/widgets', 'acme/other'] })
+  const commands = new Commands(() => deployment, {}, new AbortController().signal)
+  const url = 'https://github.com/acme/other/issues/517'
+  const issue = { id: 1, number: 517, title: 'Renovate', state: 'open', body: 'Update dependencies', user: { login: 'bob' },
+    created_at: '2026-09-09T00:00:00Z', html_url: url }
+  const paths: string[] = []
+  vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+    paths.push(args[1]!)
+    if (args[1]!.includes('/comments')) return '[]'
+    // The primary answers with a pull request of the same number; the qualified thread must not read it.
+    if (args[1]!.startsWith('repos/acme/widgets/')) return JSON.stringify({ ...issue,
+      html_url: 'https://github.com/acme/widgets/pull/517', pull_request: { url: 'x' } })
+    return JSON.stringify(issue)
+  })
+  const trigger: Trigger = { id: 'other-517', source: 'github', threads: [{ source: 'github', id: 'acme/other#517' }],
+    actor: { source: 'github', id: 'bob' }, human: true, at: '2026-09-09T00:00:00Z', text: 'Renovate', url,
+    meta: { number: 517, kind: 'issue' } }
+  const sources = new SourceRegistry(() => SettingsSchema.parse({ sources: { github: { enabled: true,
+    config: { repository: 'acme/widgets', repositories: ['acme/other'] } } } }))
+  sources.register(githubKind)
+  const result = await admissionContext(sources.threadContext(trigger)!, commands, 1)
+  expect(result.window).toMatchObject({ source_found: true, loaded_messages: 1 })
+  expect(result.messages).toEqual([expect.objectContaining({ id: url, text: 'Renovate\n\nUpdate dependencies' })])
+  expect(paths).toEqual(['repos/acme/other/issues/517', 'repos/acme/other/issues/517/comments?per_page=100&page=1'])
+  expect(paths.some(path => path.startsWith('repos/acme/widgets/') || path.includes('/pulls/'))).toBe(false)
+})
+
 it('gives a message outside a topic the five chat messages before it, and says it read the chat', async () => {
   const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
   const at = Date.parse('2026-09-11T12:00:00Z')

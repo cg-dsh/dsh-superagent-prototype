@@ -1,8 +1,9 @@
 /** Read-only GitHub repository, conversation, and CI check inspection for assessments and workers. */
 import { z } from 'zod'
-import type { ThreadFact } from '../core/index.ts'
+import type { ThreadFact, Trigger } from '../core/index.ts'
 import { validItems, type Commands, type Tally } from '../infra/commands.ts'
-import { CommentSchema, IssueSchema, isHumanLogin, reviewPlace, type GithubComment } from './github-trigger.ts'
+import { CommentSchema, IssueSchema, isHumanLogin, reviewPlace, SOURCE, type GithubComment } from './github-trigger.ts'
+import { sameRepository, threadRepositoryOf } from './github-thread.ts'
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
 const CheckSchema = z.looseObject({ name: z.string(), status: z.string(), conclusion: z.string().nullable() })
@@ -152,6 +153,21 @@ async function conversationPage(commands: Commands, number: number, page: number
   messages.push(...comments.map(comment => githubMessage(comment, comment.body ?? '', comment.html_url ?? String(comment.id))))
   return { messages, next_resource: listed.length === 100 ? String(page + 1) : null, ...tally.skipped ? { skipped: tally.skipped } : {} }
 }
+/** The repository a GitHub Trigger's own thread names, or undefined for a Trigger of another Source. */
+export function triggerRepository(trigger: Trigger, primary: string): string | undefined {
+  const thread = trigger.threads.find(item => item.source === SOURCE)
+  return thread ? threadRepositoryOf(thread.id, primary) : undefined
+}
+/**
+ * The command layer for a Trigger's GitHub reads, scoped to the repository its thread names. A qualified thread id must
+ * never read the primary repository's same-numbered Issue or PR; a command layer already scoped to that repository is
+ * kept as it is, so a single-repository read does not change.
+ */
+export function triggerCommands(commands: Commands, trigger: Trigger): Commands {
+  const primary = commands.deployment.repository
+  const repository = triggerRepository(trigger, primary) ?? primary
+  return sameRepository(commands.repository, repository) ? commands : commands.for(repository)
+}
 /**
  * Context reader for a GitHub Trigger: reads the review thread for an inline review comment (whose first comment is its
  * root and parent), or the Issue/PR conversation by page otherwise (whose first page is its root and parent).
@@ -164,14 +180,16 @@ export const githubThreadContext: ThreadContext<unknown> = {
       const message = { id: trigger.url ?? trigger.id, from: 'CI', at: trigger.at, text: trigger.text, bot: true as const }
       return { messages: [message], body: { status: 'branch_ci', messages: [message] }, status: 'branch_ci' }
     }
+    // The Trigger's thread names its repository; whatever command layer the caller passes is scoped here.
+    const scoped = triggerCommands(commands, trigger)
     const number = Number(trigger.meta.number)
     if (trigger.meta.kind === 'inline' && typeof trigger.meta.commentId === 'number') {
-      const thread = await reviewThread(commands, number, trigger.meta.commentId)
+      const thread = await reviewThread(scoped, number, trigger.meta.commentId)
       const messages = threadMessages(thread, item => item.html_url ?? String(item.id))
       const read = part === 'thread' ? messages : messages.slice(0, 1)
       return { messages: read, body: { status: 'review_thread', messages: read }, status: 'review_thread' }
     }
-    const body = await conversationPage(commands, number, Number(cursor ?? '1'))
+    const body = await conversationPage(scoped, number, Number(cursor ?? '1'))
     return { messages: body.messages, next: body.next_resource ?? undefined, body }
   },
 }

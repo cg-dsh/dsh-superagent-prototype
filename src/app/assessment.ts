@@ -8,7 +8,7 @@ import { checkedImText } from '../infra/text.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
-import { readRepositoryPath } from '../sources/github-read.ts'
+import { readRepositoryPath, triggerCommands } from '../sources/github-read.ts'
 import type { TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
 import { textPage } from './context.ts'
@@ -151,7 +151,8 @@ export class MasterAssessor implements Assessor {
         try {
           const timeout = AbortSignal.timeout(this.host.deployment.admissionContextTimeoutMs.get())
           const signal = AbortSignal.any([this.controller.signal, ...(caller ? [caller] : []), timeout])
-          const commands = this.host.commands.withSignal(signal)
+          // Reading a qualified Trigger's thread or repository stays in its own repository, never the primary's.
+          const commands = triggerCommands(this.host.commands.withSignal(signal), trigger)
           const context = await admissionContext(thread, commands, this.host.deployment.admissionContextMaxPages.get())
           if (!current()) return
           reads.context = context
@@ -227,7 +228,7 @@ export class MasterAssessor implements Assessor {
       await this.seed(candidate.evalId, trigger, signal)
       const { cache } = this.reads(candidate.evalId, trigger)
       const { snapshots, images, messages, cursors } = cache
-      const commands = this.host.commands.withSignal(AbortSignal.any([this.controller.signal, signal]))
+      const commands = triggerCommands(this.host.commands.withSignal(AbortSignal.any([this.controller.signal, signal])), trigger)
       if (read.resource === 'image') {
         if (read.offset !== 0) throw new Error('Images are not paginated; use offset 0')
         const image = images.get(read.image_id!)

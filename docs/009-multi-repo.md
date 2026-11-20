@@ -31,6 +31,10 @@ Decision: **one GitHub source, several repositories** (option B), because the ag
   the repository the work belongs to; a Ticket that did not start on GitHub uses the primary.
   The Executor's PR read and claim use the same repository.
 - The panel edits the further repositories as a textarea, one `owner/name` per line.
+- **Every read resolves the repository from the thread id it is given**: the Eval's thread window and repository-file reads
+  (`githubThreadContext`, `admissionContext`), a worker's `github/…` originals, pull-request reads and claims, and branch
+  and CI checks all scope their commands to `threadRepository(thread, primary)`. A qualified id never falls back to the
+  primary, where it would otherwise load the same-numbered Issue or PR of another repository.
 
 ## The layer beneath: every read is scoped to one repository
 

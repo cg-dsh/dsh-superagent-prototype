@@ -333,12 +333,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
-| `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
+| `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers; its thread and repository reads are scoped to the candidate's own thread repository |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext`, and `scope(repository)` for the context of another repository, carrying the commands the factory gave it |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
-| `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role |
+| `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role; a worker's `github/…` originals read the repository of its own Ticket |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools; its GitHub reads and PR claim use the repository of the Ticket's own thread |
@@ -369,8 +369,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/handover.ts` | The deterministic state a replacement orchestrator session starts from |
 | `src/sources/github-projects.ts` | GitHub Projects (v2) after a merge: the column a merged PR's Issues move to, chosen from each project's own status options |
 | `src/sources/github-thread.ts` | How a GitHub thread is named across repositories, keeping the primary repository's ids bare |
-| `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
-| `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
+| `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone`, posted in the repository the replied thread names |
+| `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page, read in the repository its Trigger's thread names (`triggerCommands`) |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |

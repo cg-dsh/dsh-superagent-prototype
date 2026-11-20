@@ -13,7 +13,7 @@ import { observePull, pullRefsOf, pullsOf, readPull, type Pull } from './github-
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, eachLimit, pause, POLL_CONCURRENCY, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
-import { branchCiThreadId, githubThreadId, githubThreadKey, sameRepository, threadNumber, threadRepository } from './github-thread.ts'
+import { branchCiThreadId, githubThreadId, githubThreadKey, sameRepository, threadNumber, threadRepository, threadRepositoryOf } from './github-thread.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
 
@@ -186,7 +186,7 @@ const refThreadId = (ctx: SourceContext, id: string): string =>
 /** The prefix that keeps another repository's KV records apart; the primary repository's keys stay exactly as they were. */
 const repoKey = (ctx: SourceContext): string => sameRepository(ctx.repository, primaryOf(ctx)) ? '' : `${ctx.repository}:`
 /** The repository a stored thread ref names, including a default-branch CI thread (`ci:` or `ci:owner/name#branch`). */
-const threadRefRepository = (ctx: SourceContext, id: string): string => threadRepository(id.startsWith('ci:') ? id.slice(3) : id, primaryOf(ctx))
+const threadRefRepository = (ctx: SourceContext, id: string): string => threadRepositoryOf(id, primaryOf(ctx))
 /** The normalised thread id of a stored ref; a CI thread already carries the form it keeps. */
 const threadRefId = (ctx: SourceContext, id: string): string => id.startsWith('ci:') ? id : refThreadId(ctx, id)
 /** Where a failure happened, so two repositories' streams are told apart; empty for the primary repository. */

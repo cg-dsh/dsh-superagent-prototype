@@ -22,6 +22,13 @@ export function threadRepository(id: string, primary: string): string {
   const hash = id.lastIndexOf('#')
   return hash === -1 ? primary : id.slice(0, hash)
 }
+/**
+ * The repository any GitHub thread id names, including the default branch's CI thread (`ci:<branch>` for the primary,
+ * `ci:<owner/name>#<branch>` for another repository).
+ */
+export function threadRepositoryOf(id: string, primary: string): string {
+  return threadRepository(id.startsWith('ci:') ? id.slice(3) : id, primary)
+}
 
 /** True when two `owner/name` values name the same repository, ignoring case as GitHub does. */
 export function sameRepository(left: string, right: string): boolean {

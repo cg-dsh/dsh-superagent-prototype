@@ -1,7 +1,8 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
+import type { Trigger } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
-import { readGithub, pullChecks } from '../src/sources/github-read.ts'
+import { githubThreadContext, readGithub, pullChecks } from '../src/sources/github-read.ts'
 
 const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
 afterEach(() => vi.restoreAllMocks())
@@ -59,6 +60,29 @@ it('reads a review thread from any of its comments, the first with its file, lin
   expect(thread.messages[0]!.text).toBe('src/render.ts:43\n   const title = view.title\n   const margin = 12\n+  const padding = 8\n\ncomment 1')
   await expect(readGithub(commands, 'github/issues/9/thread/2')).rejects.toThrow('require a pull request')
 })
+it('reads a qualified thread id in its own repository, and keeps a bare id on the primary', async () => {
+  const deployment = testDeployment({ repository: 'acme/widgets', repositories: ['acme/widgets', 'acme/other'] })
+  const scoped = new Commands(() => deployment, {}, new AbortController().signal)
+  const paths: string[] = []
+  vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+    paths.push(args[1]!)
+    if (args[1]!.includes('/comments')) return '[]'
+    const repository = /^repos\/([^/]+\/[^/]+)\//.exec(args[1]!)?.[1]
+    return JSON.stringify({ id: 1, number: 517, title: 'Renovate', state: 'open', body: `Update ${repository}`,
+      user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', html_url: `https://github.com/${repository}/issues/517` })
+  })
+  const trigger = (repository: string, thread: string): Trigger => ({ id: 'thread-source', source: 'github',
+    threads: [{ source: 'github', id: thread }], actor: { source: 'github', id: 'bob' }, human: true, at: '2026-09-09T00:00:00Z',
+    text: 'Renovate', url: `https://github.com/${repository}/issues/517`, meta: { number: 517, kind: 'issue' } })
+  const qualified = await githubThreadContext.read(scoped, trigger('acme/other', 'acme/other#517'), 'thread', undefined, {})
+  expect(paths).toEqual(['repos/acme/other/issues/517', 'repos/acme/other/issues/517/comments?per_page=100&page=1'])
+  expect(qualified.messages[0]).toMatchObject({ id: 'https://github.com/acme/other/issues/517', text: 'Renovate\n\nUpdate acme/other' })
+  paths.length = 0
+  const bare = await githubThreadContext.read(scoped, trigger('acme/widgets', '517'), 'thread', undefined, {})
+  expect(paths).toEqual(['repos/acme/widgets/issues/517', 'repos/acme/widgets/issues/517/comments?per_page=100&page=1'])
+  expect(bare.messages[0]).toMatchObject({ id: 'https://github.com/acme/widgets/issues/517' })
+})
+
 it('reads an Issue or PR as its author, time, title, state, description and a PR\'s branches', async () => {
   vi.spyOn(commands, 'gh').mockResolvedValue({ number: 9, id: 1, title: 'Fix the margin', state: 'open', body: 'Details', draft: true,
     user: { login: 'carol', type: 'User' }, created_at: '2026-09-09T00:00:00Z', html_url: 'https://github.com/acme/widgets/pull/9',
