@@ -19,6 +19,14 @@ Decision: **one GitHub source, several repositories** (option B), because the ag
 - Every thread key and cursor in `src/sources/github.ts` and `github-pull.ts` is built through the module, currently
   with `ctx.deployment.repository`, so the strings are unchanged.
 
+## The layer beneath: every read is scoped to one repository
+
+`Commands.api(path, ...)` resolves the path under `repos/<deployment.repository>/`, and every GitHub read and write goes
+through it. A second repository therefore needs the command layer to carry a repository — `commands.for(repository)` — and
+every caller of `api`, `gh` and `pages` that can touch more than the primary must use the scoped one. This is what the five
+signatures sit on top of, and why a partial change is not safe: a read that silently goes to the wrong repository either
+finds nothing or finds a same-numbered Issue that belongs to someone else.
+
 ## Remaining: thread the repository through five functions
 
 | function | where the repository comes from |
