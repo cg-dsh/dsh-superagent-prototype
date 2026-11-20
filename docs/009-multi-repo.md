@@ -11,32 +11,36 @@ Decision: **one GitHub source, several repositories** (option B), because the ag
 
 ## Landed
 
-- `src/sources/github-thread.ts` — `githubThreadId`, `threadNumber`, `threadRepository`, `sameRepository`,
-  `branchCiThreadId`, `pullNumberFromThread`, `githubThreadKey`; 7 tests.
-- `repositories: string[]` in `GithubAccountsSchema`, probed (read + push) and canonicalised per repository in
-  `resolveDeployment`, exposed as `Deployment.repositories`. A non-empty list is refused with
-  `repositoriesUnsupported` until the work below is done.
-- Every thread key and cursor in `src/sources/github.ts` and `github-pull.ts` is built through the module, currently
-  with `ctx.deployment.repository`, so the strings are unchanged.
+- `src/sources/github-thread.ts` — `githubThreadId`, `githubThreadKey`, `threadNumber`, `threadRepository`,
+  `sameRepository`, `branchCiThreadId`, `pullNumberFromThread`; 7 tests.
+- `repositories: string[]` in `GithubAccountsSchema`. `resolveDeployment` probes every repository for read and push
+  access, canonicalises its name and lists it once; setup no longer refuses a non-empty list. `Deployment.repositories`
+  holds the primary first.
+- `Commands.for(repository)` resolves every path under that repository, and `SourceContext.scope(repository)` builds the
+  context of one repository from the factory that owns the command layer. The primary repository's scoped context keeps
+  the very commands the source was given, so one repository reads exactly what it read before.
+- **One notification read per round**: `pollNotifications` reads the account's notifications once through
+  `Commands.account`, dispatches each by `notification.repository.full_name`, ignores repositories it does not watch, and
+  keys retries by thread id.
+- **Everything repository-scoped runs per repository**, inside the one round loop: observed streams, default-branch CI,
+  the PRs of open Tickets with their checks, the comment sweep and subscribed Threads. Stream cursors, the default-branch
+  CI baseline, per-PR CI state and the sweep time are stored per repository; the primary keeps its existing keys.
+- **Trigger ids and thread ids follow the repository**: the four trigger builders and `branchCiTrigger` take the thread id;
+  a Trigger from another repository addresses `github:owner/name#n`, and `bindThread`/`threadClosed` use that same id.
+- **Per-Ticket `DSH_SUPERAGENT_GITHUB_REPOSITORY`** comes from the Ticket's own thread, so prepare clones and checks out
+  the repository the work belongs to; a Ticket that did not start on GitHub uses the primary.
+  The Executor's PR read and claim use the same repository.
+- The panel edits the further repositories as a textarea, one `owner/name` per line.
 
 ## The layer beneath: every read is scoped to one repository
 
-`Commands.api(path, ...)` resolves the path under `repos/<deployment.repository>/`, and every GitHub read and write goes
-through it. A second repository therefore needs the command layer to carry a repository — `commands.for(repository)` — and
-every caller of `api`, `gh` and `pages` that can touch more than the primary must use the scoped one. This is what the five
-signatures sit on top of, and why a partial change is not safe: a read that silently goes to the wrong repository either
+`Commands.api(path, ...)` resolves the path under `repos/<commands.repository>/`, and every repository-scoped GitHub read
+and write goes through it. A scoped `Commands` therefore carries one repository — `commands.for(repository)` — and every
+caller that can touch more than the primary uses the scoped one. A read that silently goes to the wrong repository either
 finds nothing or finds a same-numbered Issue that belongs to someone else.
 
-## One notification read, per-repository watchers for the rest
-
-The notifications endpoint is account-wide and cannot be filtered to a repository, so it is read **once** per round by a
-single loop; each notification is dispatched to the watcher of its own repository (`notification.repository.full_name`,
-checked against `deployment.repositories`). Everything repository-scoped — pull requests and their checks, Issue state,
-the comment sweep, the observed streams — runs in one watcher per repository, each with its own scoped commands, its own
-round and its own cursor.
-
-That keeps the call volume at one notification read plus the repo-scoped work, and still gives each repository an
-independent view of what it owes.
+The notifications list is the exception: it belongs to the account, not a repository, so `Commands.account` calls it
+without a repository prefix.
 
 ## The scoped context must be injected, not built inside the poller
 
@@ -46,32 +50,39 @@ tests replace, so one test ended up executing the fixture's `/bin/false` CLI for
 same applies to the context: fixtures build one directly, so a context manufactured inside the poller bypasses whatever
 those fixtures provide.
 
-So the registry, not the poller, owns the scoping: `applyGithub` receives (or the context exposes) a
-`scope(repository): SourceContext` whose `commands` and `repository` are supplied by the factory, and the poller only
-calls it. A fixture can then supply its own scoped view and the tests keep control of the command layer.
+So the factory that builds the source context, not the poller, owns the scoping: `sourceContextOf` supplies a
+`scope(repository): SourceContext` whose `commands` and `repository` come from it, and a fixture may supply its own
+`scope` (or omit it, and the poller falls back to the context it was given). The poller only calls
+`ctx.scope?.(repository)`.
 
-## Remaining: thread the repository through five functions
+## One notification read, per-repository watchers for the rest
 
-| function | where the repository comes from |
+The notifications list is account-wide and cannot be filtered to a repository, so it is read **once** per round by a
+single loop; each notification is dispatched to the context of its own repository (`notification.repository.full_name`,
+checked against `deployment.repositories`). Everything repository-scoped — pull requests and their checks, Issue state,
+the comment sweep, the observed streams — runs in one watcher per repository, each with its own scoped commands, its own
+cursor and its own part of the one round.
+
+That keeps the call volume at one notification read plus the repo-scoped work, and still gives each repository an
+independent view of what it owes.
+
+## Where each repository comes from
+
+| what | where the repository comes from |
 |---|---|
-| `pollThread(ctx, round, thread)` | `threadRepository(thread.ref.id, primary)` — a thread already knows its repository |
-| `intakeComments(ctx, ref, since, round)` | add `repository` to `PullRef`; `pollThread` and the notification handler both know it |
-| `nameThread(ctx, number, title)` | the thread id, which every caller already holds |
-| `pollChecks(ctx, round, number, pr)` | add `base: { repo: { full_name } }` to `PullSchema`; the PR's own repository |
-| `failed(ctx, round, number, error)` | the thread id, for the `github:…` key it patches |
+| `pollThread(ctx, round, thread)` | `threadRepository(thread.ref.id, primary)`, filtered to the scoped context's repository |
+| `intakeComments(ctx, ref, since, round)` | `ref.thread`, carried on `PullRef` |
+| `nameThread(ctx, number, title)` | the scoped context's repository |
+| `pollChecks(ctx, round, number, pr)` | the scoped context's repository; the PR was read through it |
+| `failed(ctx, round, thread, error)` | the thread id, which names the repository |
+| notification reads | `notification.repository.full_name` |
+| Ticket pull requests | the thread ids on the Ticket's `follows` |
+| the Execution environment | the Ticket's originating thread |
 
-The four trigger builders (`commentTrigger`, `issueTrigger`, `pullTrigger`, `ciTrigger`) take the thread id as a
-parameter instead of formatting `String(number)`; `branchCiTrigger` takes `branchCiThreadId(...)`.
+## The prepare command
 
-## Then the enables
-
-1. Notification filter: `sameName(notification.repository.full_name, repository)` → membership in
-   `ctx.deployment.repositories`.
-2. `DSH_SUPERAGENT_GITHUB_REPOSITORY` per Ticket: `threadRepository(trigger.threads[0].id, deployment.repository)` in the
-   Source `environment.value` callback, instead of `deployment.repository`.
-3. Panel: a field for the list (one `owner/name` per line).
-4. Remove `repositoriesUnsupported` from `src/setup.ts`, `src/deployment.ts` and the locale.
-5. Apply the prepare command below in the Execution settings.
+Apply this in the Execution settings; it clones each repository on first use under a lock, then adds the Ticket's
+worktree from the pull request's head.
 
 ```sh
 set -e
@@ -101,3 +112,4 @@ mistake for a prepared workspace.
 Add `Catglobe/SlackIntegration` to the list and check, in order: setup accepts it (access probed), a mention there
 creates a Trigger and a Ticket, its first Ticket clones `~/src/slackintegration` under the lock, its PR binds to the
 Ticket (`agent/<name>` in that repository), CI on its PR reaches the Ticket, and the Ticket's end cleans its worktree.
+Alongside it, Catglobe's bare `github:14` threads and their cursors must keep working untouched.
