@@ -1088,7 +1088,7 @@ describe('watching more than one GitHub repository', () => {
     h.store.close()
   })
 
-  it('binds a pull request to a qualified thread in a second repository, and to the bare one in the primary', () => {
+  it('binds a pull request to a qualified thread in a second repository, and to the bare one in the primary', async () => {
     const h = host({ deployment: deploymentOf() })
     const context = h.context(githubKind)
     const gadgets = context.scope!('acme/gadgets')
@@ -1096,16 +1096,25 @@ describe('watching more than one GitHub repository', () => {
     expect(gadgets.commands.repository).toBe('acme/gadgets')
     // The primary repository keeps the very command layer the fixture provided, so nothing about it changed.
     expect(context.scope!('acme/widgets').commands).toBe(h.commands)
-    h.store.tickets.save({ ...openTicket('t1'), execution: execution('fix-1') })
+    // A Ticket that started in the second repository names that repository on its GitHub channel.
+    h.store.tickets.save({ ...openTicket('t1'), execution: execution('fix-1'),
+      channels: [githubChannel(12, 'https://github.com/acme/gadgets/issues/12', 'acme/gadgets#12')] })
     h.store.tickets.save({ ...openTicket('t2'), execution: execution('fix-2') })
-    const agentPullIn = (number: number, repository: string): Pull => ({ ...agentsPull(number, 'agent/fix-1'),
-      head: { sha: 'abc', ref: 'agent/fix-1', repo: { full_name: repository } } })
+    const agentPullIn = (number: number, repository: string, ref = 'agent/fix-1'): Pull => ({ ...agentsPull(number, ref),
+      head: { sha: 'abc', ref, repo: { full_name: repository } } })
     expect(claimPull(gadgets, 't1', agentPullIn(43, 'acme/gadgets'))).toBeUndefined()
     expect(h.store.tickets.get('t1')!.follows).toEqual([{ thread: 'github:acme/gadgets#43', own: true }])
     expect(h.store.threads.get('github:acme/gadgets#43')?.subscriptions).toEqual(['t1'])
     expect(claimPull(context, 't2', { ...agentsPull(44, 'agent/fix-2'), head: { sha: 'abc', ref: 'agent/fix-2',
       repo: { full_name: 'acme/widgets' } } })).toBeUndefined()
     expect(h.store.tickets.get('t2')!.follows).toEqual([{ thread: 'github:44', own: true }])
+    // A ticket of another repository with the same branch name is no candidate for this repository's PR.
+    h.store.tickets.save({ ...openTicket('t3'), execution: execution('fix-3'),
+      channels: [githubChannel(13, 'https://github.com/acme/gadgets/issues/13', 'acme/gadgets#13')] })
+    h.store.tickets.save({ ...openTicket('t4'), execution: execution('fix-3') })
+    await observePull(gadgets, agentPullIn(45, 'acme/gadgets', 'agent/fix-3'))
+    expect(h.store.tickets.get('t3')!.follows).toEqual([{ thread: 'github:acme/gadgets#45', own: true }])
+    expect(h.store.tickets.get('t4')).not.toHaveProperty('follows')
     h.store.close()
   })
 

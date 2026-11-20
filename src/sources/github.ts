@@ -185,6 +185,12 @@ const refThreadId = (ctx: SourceContext, id: string): string =>
   githubThreadId(threadRepository(id, primaryOf(ctx)), threadNumber(id), primaryOf(ctx))
 /** The prefix that keeps another repository's KV records apart; the primary repository's keys stay exactly as they were. */
 const repoKey = (ctx: SourceContext): string => sameRepository(ctx.repository, primaryOf(ctx)) ? '' : `${ctx.repository}:`
+/** The repository a stored thread ref names, including a default-branch CI thread (`ci:` or `ci:owner/name#branch`). */
+const threadRefRepository = (ctx: SourceContext, id: string): string => threadRepository(id.startsWith('ci:') ? id.slice(3) : id, primaryOf(ctx))
+/** The normalised thread id of a stored ref; a CI thread already carries the form it keeps. */
+const threadRefId = (ctx: SourceContext, id: string): string => id.startsWith('ci:') ? id : refThreadId(ctx, id)
+/** Where a failure happened, so two repositories' streams are told apart; empty for the primary repository. */
+const where = (ctx: SourceContext): string => sameRepository(ctx.repository, primaryOf(ctx)) ? '' : `${ctx.repository}: `
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 /** Slack added to every notified read:
  * GitHub indexes a notification seconds to a minute after the comment it is for,
@@ -229,7 +235,7 @@ async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
     if (stopped(ctx, round)) return
     if (!stream.observed(config)) { ctx.state.set(KV.github.stream(`${repoKey(ctx)}${stream.id}`), undefined); continue }
     try { await readStream(ctx, round, stream.id, stream.path, config) }
-    catch (error) { if (!stopped(ctx, round)) round.failures.push(`${stream.id}: ${String(error)}`) }
+    catch (error) { if (!stopped(ctx, round)) round.failures.push(`${where(ctx)}${stream.id}: ${String(error)}`) }
   }
   // When CI observation is turned off, clear the failure baseline but preserve the revision counter so future triggers have unique IDs.
   if (!config.observeCi) {
@@ -238,7 +244,7 @@ async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
     return
   }
   try { await pollBranchCi(ctx, round) }
-  catch (error) { if (!stopped(ctx, round)) round.failures.push(`default branch CI: ${String(error)}`) }
+  catch (error) { if (!stopped(ctx, round)) round.failures.push(`${where(ctx)}default branch CI: ${String(error)}`) }
 }
 /**
  * Polls one repository-wide event stream (oldest first) since its cursor and steps the cursor to five seconds before the
@@ -579,17 +585,17 @@ export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, roun
     try { await pollThread(ctx, round, thread) }
     catch (error) {
       if (stopped(ctx, round)) throw error
-      if (deleted(error)) round.dropped.push(refThreadId(ctx, thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
+      if (deleted(error)) round.dropped.push(threadRefId(ctx, thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
       throw error
     }
-  }, thread => !sameRepository(threadRepository(thread.ref.id, repository), ctx.repository) || round.read.has(refThreadId(ctx, thread.ref.id)))
+  }, thread => !sameRepository(threadRefRepository(ctx, thread.ref.id), ctx.repository) || round.read.has(threadRefId(ctx, thread.ref.id)))
 }
 async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Promise<void> {
   // The default branch's CI Thread has no Issue or PR to read; its CI arrives as Triggers.
   if (thread.ref.id.startsWith('ci:')) return
   const number = threadNumber(thread.ref.id)
   if (!number) throw new Error('Subscribed thread has no GitHub issue or PR number')
-  const id = refThreadId(ctx, thread.ref.id)
+  const id = threadRefId(ctx, thread.ref.id)
   round.read.add(id)
   if (typeof thread.meta.isPr !== 'boolean' || typeof thread.meta.title !== 'string') {
     const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)

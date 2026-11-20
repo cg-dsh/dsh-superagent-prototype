@@ -5,7 +5,7 @@ import type { Deployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
-import { githubThreadId, githubThreadKey, pullNumberFromThread, threadRepository } from './github-thread.ts'
+import { githubThreadId, githubThreadKey, pullNumberFromThread, sameRepository, threadRepository } from './github-thread.ts'
 import { moveIssuesToStatus } from './github-projects.ts'
 import type { GithubConfig } from './github.ts'
 
@@ -31,6 +31,11 @@ export function pullRefsOf(ticket: Pick<Ticket, 'follows'>, primary: string, ope
     const number = pullNumber(item.thread)
     return number === undefined ? [] : [{ repository: threadRepository(item.thread.slice(SOURCE.length + 1), primary), number }]
   })
+}
+/** The repository a Ticket's work lives in: the one its GitHub channel names, the primary repository otherwise. */
+export function ticketRepository(ticket: Pick<Ticket, 'channels'>, primary: string): string {
+  const channel = (ticket.channels ?? []).find(item => item.source === SOURCE)
+  return channel ? threadRepository(channel.thread.slice(SOURCE.length + 1), primary) : primary
 }
 /** True when the PR was opened by the agent account from a branch in `repository` (not a fork); the primary by default. */
 export const agentPull = (pr: { user: { login: string }; head?: { repo?: { full_name: string } | null } | null },
@@ -76,7 +81,8 @@ export async function observePull(ctx: SourceContext, pr: Pull): Promise<boolean
   const thread = `${SOURCE}:${githubThreadId(ctx.repository, pr.number, ctx.deployment.repository)}`
   if (ended) await closePull(ctx, pr)
   else {
-    const candidates = agentPull(pr, ctx.deployment, ctx.repository) ? ctx.tickets.open().filter(ticket => ticketBranch(ticket, pr.head.ref)) : []
+    const candidates = agentPull(pr, ctx.deployment, ctx.repository) ? ctx.tickets.open().filter(ticket =>
+      sameRepository(ticketRepository(ticket, ctx.deployment.repository), ctx.repository) && ticketBranch(ticket, pr.head.ref)) : []
     const ticket = candidates.length === 1 ? candidates[0]! : undefined
     // A PR the ticket followed until it closed, and that is open again, is followed again.
     const reopened = ticket?.follows?.some(item => item.thread === thread && item.closed)

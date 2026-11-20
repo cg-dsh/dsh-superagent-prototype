@@ -2,9 +2,8 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
+import { claimPull, readPull, ticketRepository } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
-import { threadRepository } from '../../sources/github-thread.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
@@ -25,9 +24,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
   // A Ticket's pull requests are read in the repository its own thread belongs to; a Ticket that started elsewhere
   // (such as in Feishu) has none of its own, and the agent opens its PR in the primary repository.
-  const primary = host.github.deployment.repository
-  const channel = (ticket.channels ?? []).find(item => item.source === 'github')
-  const repository = channel ? threadRepository(channel.thread.slice('github:'.length), primary) : primary
+  const repository = ticketRepository(ticket, host.github.deployment.repository)
   const github = host.github.scope?.(repository) ?? host.github
   return [
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
