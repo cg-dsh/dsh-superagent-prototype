@@ -48,9 +48,12 @@ const AUTO_MERGE_ON: ThreadFact = { label: { zh: '自动合并', en: 'Auto-merge
 export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): string | undefined {
   const ticket = ctx.tickets.get(ticketId)
   if (!ticket || !liveTicket(ticket)) return 'Ticket ended because its PR was closed'
-  const thread = `${SOURCE}:${githubThreadId(ctx.repository, pr.number, ctx.deployment.repository)}`
+  const id = githubThreadId(ctx.repository, pr.number, ctx.deployment.repository)
+  const thread = `${SOURCE}:${id}`
   const source = ctx.triggers.get(ticket.origin.triggerId)
+  // The originating PR is the one on this thread: the same number in another repository is a different PR.
   const started = source?.source === SOURCE && source.meta.isPr === true && source.meta.number === pr.number
+    && source.threads.some(item => item.source === SOURCE && item.id === id)
   const opened = agentPull(pr, ctx.deployment, ctx.repository) && ticketBranch(ticket, pr.head.ref)
   if (!started && !opened) {
     const { login } = ctx.deployment.github
