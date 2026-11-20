@@ -39,3 +39,8 @@ export function pullNumberFromThread(thread: string, source = 'github'): number 
   const number = threadNumber(thread.slice(source.length + 1))
   return Number.isFinite(number) && number > 0 ? number : undefined
 }
+
+/** The Thread key an Issue or PR carries, in the source's key space. */
+export function githubThreadKey(repository: string, number: number, primary: string): string {
+  return `github:${githubThreadId(repository, number, primary)}`
+}

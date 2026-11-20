@@ -13,7 +13,7 @@ import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, eachLimit, pause, POLL_CONCURRENCY, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
-import { threadNumber } from './github-thread.ts'
+import { branchCiThreadId, githubThreadId, githubThreadKey, threadNumber, threadRepository } from './github-thread.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
 
@@ -189,7 +189,7 @@ function failed(ctx: SourceContext, round: Round, number: number, error: unknown
   if (deleted(error)) round.dropped.push(number)
   else if (abandoned) round.abandoned.push(number)
   else round.failures.push(`#${number}: ${String(error)}`)
-  ctx.threads.patch(`github:${number}`, { pollError: String(error) })
+  ctx.threads.patch(githubThreadKey(ctx.deployment.repository, number, ctx.deployment.repository), { pollError: String(error) })
 }
 function included(raw: string): { headers: string; body: string } {
   const split = raw.search(/\r?\n\r?\n/)
@@ -294,7 +294,7 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
     const summary = ciSummary(snapshot, branch, `github/commits/${head.sha}/checks`)
     const url = `https://github.com/${ctx.deployment.repository}/commit/${head.sha}`
     await ctx.receive(branchCiTrigger(branch, head.sha, revision, summary, url))
-    ctx.threads.describe(`github:ci:${branch}`, { label: `CI on ${branch}`, facts: { ci: ciFact(counts) } })
+    ctx.threads.describe(`github:${branchCiThreadId(branch, ctx.deployment.repository, ctx.deployment.repository)}`, { label: `CI on ${branch}`, facts: { ci: ciFact(counts) } })
   }
   ctx.state.set(KV.github.branchCi, { branch, failures: now, revision })
 }
@@ -361,7 +361,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    items.set(number, { since: [state.get(KV.github.cursor(githubThreadId(ctx.deployment.repository, number, ctx.deployment.repository))) ?? since, since].sort().at(-1)!, pr })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
@@ -410,8 +410,8 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
     await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
     if (pr.title) nameThread(ctx, number, pr.title)
   }
-  ctx.state.set(KV.github.cursor(number), cursorAt(round.started))
-  ctx.threads.patch(`github:${number}`, { pollError: undefined })
+  ctx.state.set(KV.github.cursor(githubThreadId(ctx.deployment.repository, number, ctx.deployment.repository)), cursorAt(round.started))
+  ctx.threads.patch(githubThreadKey(ctx.deployment.repository, number, ctx.deployment.repository), { pollError: undefined })
 }
 /** Reads and observes a PR at most once per polling round. */
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
@@ -471,20 +471,22 @@ async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<vo
       if (ctx.state.get(KV.github.requesterClosed(ticket.id)) === at) continue
       ctx.state.set(KV.github.requesterClosed(ticket.id), at)
       const open = pullsOf(ticket, true)
-      if (open.length) await ctx.receive(closedIssueTrigger(issue, number, open))
+      const threadId = githubThreadId(ctx.deployment.repository, number, ctx.deployment.repository)
+      if (open.length) await ctx.receive(closedIssueTrigger(issue, number, open, threadId))
       else ctx.tickets.requesterClosed(ticket.id, at)
     }
   })
 }
 /** The Trigger that tells an Executor its Issue was closed while its PR is still open. */
-function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, open: readonly number[]): Trigger {
+function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, open: readonly number[],
+  threadId: string): Trigger {
   const at = (issue as { closed_at?: string | null }).closed_at ?? new Date().toISOString()
   const list = open.map(item => `#${item}`).join(', ')
   return { id: key('github-issue-closed', String(number), at), source: SOURCE,
-    threads: [{ source: SOURCE, id: String(number) }], actor: { source: SOURCE, id: issue.user?.login ?? '' },
+    threads: [{ source: SOURCE, id: threadId }], actor: { source: SOURCE, id: issue.user?.login ?? '' },
     human: true, at, url: issue.html_url,
     text: `Issue #${number} was closed while PR ${list} is still open. Reopen the Issue with one line saying why, and ask for the PR to be merged or closed; never leave it dangling.`,
-    channel: { source: SOURCE, thread: `github:${number}`, address: { number: String(number), url: issue.html_url } },
+    channel: { source: SOURCE, thread: `github:${threadId}`, address: { number: String(number), url: issue.html_url } },
     meta: { number, isPr: false, kind: 'issue' } }
 }
 
@@ -507,11 +509,11 @@ async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: 
   const revision = previous ? previous.revision + 1 : 0
   if (previous) await ctx.receive(ciTrigger(pr, revision, ciSummary(snapshot, `PR #${number}`, `github/pulls/${number}/checks`)))
   ctx.state.set(KV.github.ci(number), { fingerprint, revision })
-  ctx.threads.describe(`github:${number}`, { facts: { ci: ciFact(ciCounts(snapshot)) } })
+  ctx.threads.describe(githubThreadKey(ctx.deployment.repository, number, ctx.deployment.repository), { facts: { ci: ciFact(ciCounts(snapshot)) } })
 }
 function nameThread(ctx: SourceContext, number: number, title: string): void {
-  ctx.threads.patch(`github:${number}`, { title })
-  ctx.threads.describe(`github:${number}`, { label: `#${number} ${title}`, facts: { number: { value: `#${number}` } } })
+  ctx.threads.patch(githubThreadKey(ctx.deployment.repository, number, ctx.deployment.repository), { title })
+  ctx.threads.describe(githubThreadKey(ctx.deployment.repository, number, ctx.deployment.repository), { label: `#${number} ${title}`, facts: { number: { value: `#${number}` } } })
 }
 /** Polls subscribed Issue and PR Threads not already read in this round; a deleted (410) Issue is still polled within the horizon (costing one read) and does not fail the round. */
 export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
@@ -544,7 +546,7 @@ async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Pro
     if (issue.title) nameThread(ctx, number, issue.title)
     thread = ctx.threads.get(thread.key) ?? thread
   }
-  const checkpoint = KV.github.cursor(number)
+  const checkpoint = KV.github.cursor(githubThreadId(ctx.deployment.repository, number, ctx.deployment.repository))
   const since = ctx.state.get(checkpoint) ?? thread.createdAt
   if (thread.meta.isPr === true) {
     const pr = await pull(ctx, round, number)

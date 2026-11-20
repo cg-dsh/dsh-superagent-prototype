@@ -5,6 +5,7 @@ import type { Deployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
+import { githubThreadKey, pullNumberFromThread } from './github-thread.ts'
 import { moveIssuesToStatus } from './github-projects.ts'
 import type { GithubConfig } from './github.ts'
 
@@ -17,7 +18,7 @@ const PullSchema = z.looseObject({
 export type Pull = z.infer<typeof PullSchema> & { number: number }
 export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
   ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
-const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
+const pullNumber = (thread: string): number | undefined => pullNumberFromThread(thread, SOURCE)
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])
 export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => pullsOf(ticket, true).at(-1) ?? pullsOf(ticket).at(-1)
@@ -66,13 +67,13 @@ export async function observePull(ctx: SourceContext, pr: Pull): Promise<boolean
     const reopened = ticket?.follows?.some(item => item.thread === `${SOURCE}:${pr.number}` && item.closed)
     if (ticket && (reopened || pullsOf(ticket, true).every(number => number === pr.number))) claimPull(ctx, ticket.id, pr)
   }
-  ctx.threads.describe(`github:${pr.number}`, { facts: { autoMerge: !ended && pr.auto_merge != null ? AUTO_MERGE_ON : null } })
+  ctx.threads.describe(githubThreadKey(ctx.deployment.repository, pr.number, ctx.deployment.repository), { facts: { autoMerge: !ended && pr.auto_merge != null ? AUTO_MERGE_ON : null } })
   return ended
 }
 function bind(ctx: SourceContext, ticketId: string, pr: Pull, own: boolean): void {
   ctx.atomic(() => {
     ctx.tickets.bindThread(ticketId, { source: SOURCE, id: String(pr.number) }, own)
-    ctx.threads.patch(`github:${pr.number}`, { number: pr.number, isPr: true, url: pr.html_url, prAuthor: pr.user.login })
+    ctx.threads.patch(githubThreadKey(ctx.deployment.repository, pr.number, ctx.deployment.repository), { number: pr.number, isPr: true, url: pr.html_url, prAuthor: pr.user.login })
   })
 }
 /**
@@ -101,9 +102,9 @@ async function moveToStatus(ctx: SourceContext, pr: Pull, issues: readonly numbe
   })
   try {
     const move = await moveIssuesToStatus(ctx.commands, ctx.deployment.repository, issues, hint)
-    if (move.lines.length) ctx.threads.describe(`github:${pr.number}`, { facts: { projectStatus: fact(move.lines.join('; '), !move.ok) } })
+    if (move.lines.length) ctx.threads.describe(githubThreadKey(ctx.deployment.repository, pr.number, ctx.deployment.repository), { facts: { projectStatus: fact(move.lines.join('; '), !move.ok) } })
   } catch (error) {
-    ctx.threads.describe(`github:${pr.number}`, { facts: { projectStatus: fact(`failed: ${error instanceof Error ? error.message : String(error)}`, true) } })
+    ctx.threads.describe(githubThreadKey(ctx.deployment.repository, pr.number, ctx.deployment.repository), { facts: { projectStatus: fact(`failed: ${error instanceof Error ? error.message : String(error)}`, true) } })
   }
 }
 /**
