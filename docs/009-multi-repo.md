@@ -37,6 +37,8 @@ Decision: **one GitHub source, several repositories** (option B), because the ag
   primary, where it would otherwise load the same-numbered Issue or PR of another repository.
 - **Per-Ticket reconciliation follows an idle ladder**, described below: notifications still poll every round, while a
   Ticket's pull requests, checks and Issue state are read only when the interval its own idle time earns has passed.
+- **A conversation that is gone settles**: a reply GitHub answers 404 or 410 for is dropped instead of retried, and a
+  subscribed Thread whose Issue or PR GitHub no longer has is stated once and left out of later sweeps.
 
 ## The layer beneath: every read is scoped to one repository
 
@@ -126,6 +128,19 @@ The kept bodies live under `github-conditional:<resource>:<thread id>` (`pull`, 
 primary repository's keys keep their shapes and another repository's records are named by its qualified thread id. A list
 GitHub answers with a next page is read in full and not kept, because an ETag describes only the page it came from. A
 reconciliation that answers 304 therefore costs no charged GitHub call at all; only a change costs that Ticket's reads.
+
+## When a conversation is gone
+
+GitHub answers 404 for an Issue that is missing, and 410 for one it deleted. A transferred Issue appears under its new
+repository, while the old issue and its comments answer 404. A reply that fails that way settles its receipt `dropped`
+(`channelGone`) instead of retrying forever, so it stops waiting and the `reply` health clears. The same answers stop the
+poll sweep from re-reading a subscribed Thread whose Issue or PR is gone: it records the fact on the Thread once, names it
+in that round as deleted on GitHub, and leaves it out of later sweeps. A notification still reads the thread when one
+arrives, so a message there is not lost.
+
+`delivery` (an Input into a worker's Session), `notice` and `relay` (the main Session), `launch`, `cleanup` and
+`assessment` address local Sessions or a Ticket rather than a remote conversation, so a "gone" target has no meaning for
+them; their failures keep retrying with backoff and are surfaced where they apply.
 
 ## The prepare command
 

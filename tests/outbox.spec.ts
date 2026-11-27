@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import type { OutboundMessage } from '../src/core/index.ts'
-import { Commands } from '../src/infra/commands.ts'
+import { Commands, commandError } from '../src/infra/commands.ts'
 import type { SourceKind } from '../src/sources/kind.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -39,4 +39,43 @@ it('keeps a message for a Source that is not installed waiting, and sends it onc
   // A message whose Source was not installed is tried again after 5 seconds.
   await at(5000)
   expect([h.runtime.outbox.status('waiting'), sent.map(message => message.id)]).toEqual(['sent', ['waiting']])
+})
+
+/** A GitHub reply to an Issue, as a source context would queue it. */
+const goneChannel = { source: 'github', thread: 'github:1542',
+  address: { number: '1542', url: 'https://github.com/acme/widgets/issues/1542' } }
+const refuse = (status: number, text: string) => commandError({ stderr: `gh: ${text} (HTTP ${status})`, code: 1 })
+
+it('drops a reply GitHub says is gone, and the reply health recovers from its earlier retries', async () => {
+  const gh = vi.mocked(Commands.prototype.gh)
+  h.runtime.outbox.send({ id: 'gone-404', channel: goneChannel, text: 'Done', kind: 'reply' })
+  gh.mockRejectedValue(refuse(502, 'Bad Gateway'))
+  await h.runtime.sendReplies()
+  await at(5000); await at(15_000)
+  // Three failed attempts make the reply health an error, as it was in the deployment.
+  expect(h.runtime.health.reply).toMatchObject({ state: 'error' })
+  // GitHub no longer has the Issue: the receipt settles dropped instead of retrying, so nothing waits and health clears.
+  gh.mockRejectedValue(refuse(404, 'Not Found'))
+  await at(40_000)
+  expect([h.runtime.outbox.status('gone-404'), h.runtime.store.receipts.get('gone-404')?.dropped?.reason])
+    .toEqual(['dropped', 'channelGone'])
+  expect(h.runtime.health.reply).toMatchObject({ state: 'ready', detail: 'Nothing waiting' })
+})
+
+it('drops a 410 reply as gone, and keeps a transient 502 reply retrying', async () => {
+  const gh = vi.mocked(Commands.prototype.gh)
+  let attempts = 0
+  gh.mockImplementation(async () => { attempts += 1; throw refuse(410, 'This issue was deleted') })
+  h.runtime.outbox.send({ id: 'gone-410', channel: goneChannel, text: 'Done', kind: 'reply' })
+  await h.runtime.sendReplies()
+  expect([h.runtime.outbox.status('gone-410'), h.runtime.store.receipts.get('gone-410')?.dropped?.reason])
+    .toEqual(['dropped', 'channelGone'])
+  attempts = 0
+  gh.mockImplementation(async () => { attempts += 1; throw refuse(502, 'Bad Gateway') })
+  h.runtime.outbox.send({ id: 'retry-502', channel: goneChannel, text: 'Done again', kind: 'reply' })
+  await h.runtime.sendReplies()
+  expect([h.runtime.outbox.status('retry-502'), attempts]).toEqual(['pending', 1])
+  // The retry due after five seconds runs, and the receipt is still pending rather than dropped.
+  await at(5000)
+  expect([h.runtime.outbox.status('retry-502'), attempts]).toEqual(['pending', 2])
 })

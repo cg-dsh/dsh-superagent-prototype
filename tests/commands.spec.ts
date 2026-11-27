@@ -106,15 +106,14 @@ describe('Channels', () => {
     const value = commands()
     vi.spyOn(value, 'pages').mockResolvedValue([])
     const gh = vi.spyOn(value, 'gh')
-    for (const stderr of ['gh: This issue was deleted (HTTP 410)', 'gh: Unable to create comment because issue is locked. (HTTP 403)']) {
+    for (const stderr of ['gh: This issue was deleted (HTTP 410)', 'gh: Not Found (HTTP 404)',
+      'gh: Unable to create comment because issue is locked. (HTTP 403)']) {
       gh.mockRejectedValueOnce(commandError({ stderr, code: 1 }))
       expect(await send(value, reply)).toBe('gone')
     }
-    // GitHub also answers 404 for a private repository the agent lost access to, so 404 is retried rather than dropped.
-    for (const stderr of ['gh: Not Found (HTTP 404)', 'gh: Server Error (HTTP 500)']) {
-      gh.mockRejectedValueOnce(commandError({ stderr, code: 1 }))
-      await expect(send(value, reply)).rejects.toThrow(stderr)
-    }
+    // A server error is transient: the reply stays for a retry.
+    gh.mockRejectedValueOnce(commandError({ stderr: 'gh: Server Error (HTTP 500)', code: 1 }))
+    await expect(send(value, reply)).rejects.toThrow('HTTP 500')
   })
   it('reply on the PR\'s conversation when the review comment a reply points at is gone', async () => {
     const value = commands()

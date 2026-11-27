@@ -757,7 +757,8 @@ describe('github source', () => {
     })
     // With every failure a 410, the round succeeds and names what GitHub deleted.
     await pollRound(h)
-    expect(h.health.github).toMatchObject({ state: 'ready', detail: expect.stringContaining('deleted on GitHub: #5, #7, #8') })
+    // #5 was stated as gone once and is no longer swept; the Ticket's PRs are still named while their reads fail.
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: expect.stringContaining('deleted on GitHub: #7, #8') })
     h.store.close()
   })
   it('waits for setup, pauses while the Source is off, and counts only consecutive failed polls towards an error', async () => {
@@ -1131,6 +1132,27 @@ describe('github source', () => {
     // The failed reconciliation records nothing, so the next round tries it again instead of waiting out a ladder.
     expect(h.store.get('github-reconcile:t9')).toBeUndefined()
     expect(h.store.get('github-conditional:pull:9')).toBeUndefined()
+    h.store.close()
+  })
+  it('states once that a Thread\'s Issue is gone, then stops reading it', async () => {
+    const h = host()
+    h.store.tickets.save(openTicket('ticket'))
+    subscribed(h, { source: 'github', id: '1542' }, { number: 1542, isPr: false, title: 'Gone' })
+    h.store.threads.save({ ...h.store.threads.get('github:1542')!, lastAt: new Date().toISOString() })
+    const reads = github(h, { notifications: [], 'issues/1542/comments': refused(404, 'Not Found') })
+    // A deleted or transferred Issue answers 404 for the comments a subscribed Thread reads.
+    await pollRound(h)
+    expect(bare(reads)).toContain('issues/1542/comments')
+    const thread = h.store.threads.get('github:1542')!
+    expect(thread.meta).toMatchObject({ gone: expect.stringContaining('404'), facts: { gone: { problem: true } } })
+    expect(thread.meta).not.toHaveProperty('pollError')
+    // The round names it once as deleted on GitHub, and does not fail.
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: expect.stringContaining('deleted on GitHub: #1542') })
+    // Gone, it is left out of the sweep: no further read, and the Source stays ready.
+    reads.length = 0
+    await pollRound(h)
+    expect(bare(reads)).not.toContain('issues/1542/comments')
+    expect(h.health.github).toMatchObject({ state: 'ready' })
     h.store.close()
   })
 })

@@ -1,6 +1,6 @@
 /** GitHub source kind definition, notification and repository polling loops, and Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
-import { key, type Thread, type Ticket, type Trigger } from '../core/index.ts'
+import { key, type Thread, type ThreadFact, type Ticket, type Trigger } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
@@ -275,6 +275,20 @@ function rateLimited(error: unknown): boolean {
 }
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
+/** The fact a Thread states once GitHub no longer has the Issue or PR it names, so its readers know why it is quiet. */
+const THREAD_GONE: ThreadFact = { label: { zh: 'GitHub 线程', en: 'GitHub thread' },
+  value: { zh: 'Issue 或 PR 已删除或转移', en: 'Its Issue or PR is deleted or transferred' }, problem: true }
+/** True when a read says the Issue or PR a Thread names is no longer there: deleted (410) or missing (404, which also covers a transfer). */
+const goneRead = (error: unknown): boolean => error instanceof CliError && (error.code === 404 || error.code === 410)
+/**
+ * States once that GitHub no longer has the Issue or PR a Thread names, and takes it out of the sweep. The round names it
+ * among what GitHub deleted; a later notification still reads it, so a message there is not lost.
+ */
+function threadGone(ctx: SourceContext, round: Round, thread: Thread, error: unknown): void {
+  if (thread.meta.gone === undefined) round.dropped.push(threadRefId(ctx, thread.ref.id))
+  ctx.threads.patch(thread.key, { gone: String(error), pollError: undefined })
+  ctx.threads.describe(thread.key, { facts: { gone: THREAD_GONE } })
+}
 /** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
 function failed(ctx: SourceContext, round: Round, thread: string, error: unknown, abandoned = false): void {
   const id = refThreadId(ctx, thread)
@@ -720,10 +734,13 @@ export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, roun
     try { await pollThread(ctx, round, thread) }
     catch (error) {
       if (stopped(ctx, round)) throw error
-      if (deleted(error)) round.dropped.push(threadRefId(ctx, thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
+      // GitHub no longer has the Issue or PR this Thread names: state it once and stop re-reading it, without failing the round.
+      if (goneRead(error)) { threadGone(ctx, round, thread, error); return }
+      round.failures.push(`${thread.key}: ${String(error)}`)
       throw error
     }
-  }, thread => !sameRepository(threadRefRepository(ctx, thread.ref.id), ctx.repository) || round.read.has(threadRefId(ctx, thread.ref.id)))
+  }, thread => !sameRepository(threadRefRepository(ctx, thread.ref.id), ctx.repository)
+    || thread.meta.gone !== undefined || round.read.has(threadRefId(ctx, thread.ref.id)))
 }
 async function pollThread(ctx: SourceContext, round: Round, thread: Thread): Promise<void> {
   // The default branch's CI Thread has no Issue or PR to read; its CI arrives as Triggers.
