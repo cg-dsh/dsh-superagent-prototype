@@ -4,14 +4,15 @@ import { key, type Thread, type Ticket, type Trigger } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
-import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
+import { CheckRunPageSchema, ciCounts, ciFact, ciFailures, ciSnapshot, ciSummary, checkRunPages, commitStatusPages,
+  githubThreadContext, pullChecks, type CheckRunPage, type CiSnapshot } from './github-read.ts'
 import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
-import { observePull, pullRefsOf, pullsOf, readPull, ticketRepository, type Pull } from './github-pull.ts'
+import { observePull, pullRefsOf, PullSchema, pullsOf, readPull, ticketRepository, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
-import { KV } from '../kv.ts'
+import { KV, type Key } from '../kv.ts'
 import { cursorAt, eachLimit, pause, POLL_CONCURRENCY, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
 import { noteActivity, noteReconciliation, reconciliationDue, scheduleOf } from './github-reconcile.ts'
 import { branchCiThreadId, githubThreadId, githubThreadKey, sameRepository, threadNumber, threadRepository, threadRepositoryOf } from './github-thread.ts'
@@ -203,6 +204,23 @@ const threadRefRepository = (ctx: SourceContext, id: string): string => threadRe
 const threadRefId = (ctx: SourceContext, id: string): string => id.startsWith('ci:') ? id : refThreadId(ctx, id)
 /** Where a failure happened, so two repositories' streams are told apart; empty for the primary repository. */
 const where = (ctx: SourceContext): string => sameRepository(ctx.repository, primaryOf(ctx)) ? '' : `${ctx.repository}: `
+/** A GitHub resource's conditional read record: the body it last returned and the validator GitHub gave for it. */
+type ConditionalRecord = { value: unknown; etag?: string; lastModified?: string }
+/** What a conditional read keeps between rounds: the body and the validator that describes it. */
+interface Kept<T> { value: T; etag?: string; lastModified?: string }
+/** The body and validator a conditional read kept, when present and still validating; otherwise undefined, so the read is a full one. */
+function kept<T>(ctx: SourceContext, key: Key<ConditionalRecord>, schema: z.ZodType<T>): Kept<T> | undefined {
+  const stored = ctx.state.get(key)
+  if (!stored || typeof stored !== 'object') return undefined
+  const parsed = schema.safeParse(stored.value)
+  return parsed.success ? { value: parsed.data, ...stored.etag ? { etag: stored.etag } : {},
+    ...stored.lastModified ? { lastModified: stored.lastModified } : {} } : undefined
+}
+/** Keeps what a 200 returned, so the next round sends its ETag and an unchanged resource answers 304. */
+function keep<T>(ctx: SourceContext, key: Key<ConditionalRecord>, answer: { value: T; etag?: string; lastModified?: string }): void {
+  ctx.state.set(key, { value: answer.value, ...answer.etag ? { etag: answer.etag } : {},
+    ...answer.lastModified ? { lastModified: answer.lastModified } : {} })
+}
 /** The Tickets this round owes a reconciliation: the frozen due set, or the ladder when a step is called on its own. */
 function dueTickets(ctx: SourceContext, round: Round): Ticket[] {
   const now = Date.parse(round.started)
@@ -510,12 +528,21 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
   ctx.state.set(KV.github.cursor(thread), cursorAt(round.started))
   ctx.threads.patch(githubThreadKey(ctx.repository, number, primaryOf(ctx)), { pollError: undefined })
 }
+/** Reads a round's pull request conditionally: an unchanged PR answers 304 and its kept body is used, so it costs no rate limit. */
+async function readPullForPoll(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
+  const key = KV.github.conditional('pull', threadIdOf(ctx, number))
+  const prior = kept(ctx, key, PullSchema)
+  const answer = await ctx.commands.withSignal(round.signal).apiConditional(PullSchema, `pulls/${number}`, prior)
+  if (answer.notModified) return prior ? { ...prior.value, number } : readPull(ctx, number, round.signal)
+  keep(ctx, key, answer)
+  return { ...answer.value, number }
+}
 /** Reads and observes a PR at most once per polling round. */
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   const thread = threadIdOf(ctx, number)
   let read = round.pulls.get(thread)
   if (!read) {
-    read = readPull(ctx, number, round.signal).then(async pr => { await observePull(ctx, pr); return pr })
+    read = readPullForPoll(ctx, round, number).then(async pr => { await observePull(ctx, pr); return pr })
     round.pulls.set(thread, read)
   }
   return read
@@ -542,13 +569,21 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
     }
   }
 }
+/** Reads the Issue that can withdraw a Ticket conditionally: an unchanged Issue answers 304 and its kept state is used. */
+async function readIssueForPoll(ctx: SourceContext, round: Round, number: number): Promise<z.infer<typeof IssueSchema>> {
+  const key = KV.github.conditional('issue', threadIdOf(ctx, number))
+  const prior = kept(ctx, key, IssueSchema)
+  const answer = await ctx.commands.withSignal(round.signal).apiConditional(IssueSchema, `issues/${number}`, prior)
+  if (answer.notModified) return prior ? prior.value : ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
+  keep(ctx, key, answer)
+  return answer.value
+}
 /**
  * Notices that a person closed the Issue that started an open Ticket. A withdrawn request ends the Ticket rather than
  * leaving it waiting on a question nobody will answer. A Ticket whose own PR is still open is the exception: the work
  * exists, so its Executor is asked to reopen the Issue and settle the PR instead of the Ticket ending silently.
  */
 async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<void> {
-  const commands = ctx.commands.withSignal(round.signal)
   const repository = primaryOf(ctx)
   const tickets = dueTickets(ctx, round).filter(ticket => sameRepository(ticketRepository(ticket, repository), ctx.repository))
   await eachLimit(tickets, POLL_CONCURRENCY, async ticket => {
@@ -564,7 +599,7 @@ async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<vo
       if ((channel.address.url ?? '').includes('/pull/')) continue
       let issue: z.infer<typeof IssueSchema>
       try {
-        issue = await commands.api(IssueSchema, `issues/${number}`)
+        issue = await readIssueForPoll(ctx, round, number)
       } catch (error) {
         round.retry.add(ticket.id)
         if (!stopped(ctx, round)) failed(ctx, round, channelThread, error)
@@ -624,6 +659,26 @@ export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, 
     else observed(round, item.ticket.id).pulls.push(observation)
   }
 }
+/** One page of a GitHub list read conditionally; a list with a next page is read in full and not kept, because an ETag describes only the page it came from. */
+async function polledPages<T>(ctx: SourceContext, round: Round, resource: string, thread: string, path: string,
+  schema: z.ZodType<T>, full: () => Promise<T[]>): Promise<T[]> {
+  const key = KV.github.conditional(resource, thread)
+  const prior = kept(ctx, key, schema)
+  const answer = await ctx.commands.withSignal(round.signal).apiConditional(schema, path, prior)
+  if (answer.notModified) return prior ? [prior.value] : full()
+  if (answer.more) { ctx.state.set(key, undefined); return full() }
+  keep(ctx, key, answer)
+  return [answer.value]
+}
+/** A PR's CI as this round read it: both of its list reads are conditional, so unchanged checks cost no rate limit. */
+async function pullChecksForPoll(ctx: SourceContext, round: Round, thread: string, head: string): Promise<CiSnapshot> {
+  const commands = ctx.commands.withSignal(round.signal)
+  const pages = await polledPages<CheckRunPage>(ctx, round, 'check-runs', thread, `commits/${head}/check-runs?per_page=100`,
+    CheckRunPageSchema, () => checkRunPages(commands, head))
+  const statuses = await polledPages<unknown[]>(ctx, round, 'statuses', thread, `commits/${head}/statuses?per_page=100`,
+    z.array(z.unknown()), () => commitStatusPages(commands, head))
+  return ciSnapshot(head, pages.flatMap(page => page.check_runs), statuses.flat(), round.tally)
+}
 /** Polls a PR's CI checks at most once per round, however many Tickets follow that pull request. */
 function pullChecksOnce(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<string> {
   const thread = threadIdOf(ctx, number)
@@ -633,9 +688,9 @@ function pullChecksOnce(ctx: SourceContext, round: Round, number: number, pr: Pu
 }
 /** Reads a PR's CI checks and answers their fingerprint; a change after the first look is a Trigger. */
 async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<string> {
-  const snapshot = await pullChecks(ctx.commands.withSignal(round.signal), pr.head.sha, round.tally)
-  const fingerprint = key(JSON.stringify(snapshot))
   const thread = threadIdOf(ctx, number)
+  const snapshot = await pullChecksForPoll(ctx, round, thread, pr.head.sha)
+  const fingerprint = key(JSON.stringify(snapshot))
   const previous = ctx.state.get(KV.github.ci(thread))
   if (previous?.fingerprint === fingerprint) return fingerprint
   const revision = previous ? previous.revision + 1 : 0

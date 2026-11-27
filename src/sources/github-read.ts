@@ -57,17 +57,31 @@ export async function readRepositoryPath(commands: Commands, path: string, kind:
   return entries.map(entry => entry.name).filter(name => !name.startsWith('.') && name !== 'node_modules').sort().join('\n')
 }
 
-/** Reads check runs and commit statuses for a commit without emitting a trigger. */
-export async function pullChecks(commands: Commands, head: string, tally?: Tally): Promise<CiSnapshot> {
-  const page = z.looseObject({ check_runs: z.array(z.unknown()) })
-  const pages = await commands.api(z.array(page), `commits/${head}/check-runs?per_page=100`, '--paginate', '--slurp')
-  const runs = validItems(CheckSchema, pages.flatMap(page => page.check_runs), tally)
-  const statuses = await commands.pages(StatusSchema, `commits/${head}/statuses?per_page=100`, tally)
+/** One page of a commit's check runs, as GitHub returns it and as a conditional poll keeps it. */
+export const CheckRunPageSchema = z.looseObject({ check_runs: z.array(z.unknown()) })
+export type CheckRunPage = z.infer<typeof CheckRunPageSchema>
+/** Reads every page of a commit's check runs, unvalidated so a conditional poll can keep what it read. */
+export async function checkRunPages(commands: Commands, head: string): Promise<CheckRunPage[]> {
+  return commands.api(z.array(CheckRunPageSchema), `commits/${head}/check-runs?per_page=100`, '--paginate', '--slurp')
+}
+/** Reads every page of a commit's statuses, unvalidated so a conditional poll can keep what it read. */
+export async function commitStatusPages(commands: Commands, head: string): Promise<unknown[][]> {
+  return commands.api(z.array(z.array(z.unknown())), `commits/${head}/statuses?per_page=100`, '--paginate', '--slurp')
+}
+/** Builds a commit's CI snapshot from the check runs and statuses its reads returned, skipping and counting what does not validate. */
+export function ciSnapshot(head: string, checkRuns: readonly unknown[], statuses: readonly unknown[], tally?: Tally): CiSnapshot {
+  const runs = validItems(CheckSchema, checkRuns, tally)
   const latest = new Map<string, string>()
-  for (const status of statuses) if (!latest.has(status.context)) latest.set(status.context, status.state)
+  for (const status of validItems(StatusSchema, statuses, tally)) if (!latest.has(status.context)) latest.set(status.context, status.state)
   const checks = runs.map(({ name, status, conclusion }) => ({ name, status, conclusion }))
   return { head, checks: checks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     statuses: [...latest].map(([context, state]) => ({ context, state })).sort((a, b) => a.context.localeCompare(b.context)) }
+}
+/** Reads check runs and commit statuses for a commit without emitting a trigger. */
+export async function pullChecks(commands: Commands, head: string, tally?: Tally): Promise<CiSnapshot> {
+  const pages = await checkRunPages(commands, head)
+  const statuses = await commands.pages(z.unknown(), `commits/${head}/statuses?per_page=100`)
+  return ciSnapshot(head, pages.flatMap(page => page.check_runs), statuses, tally)
 }
 
 /** Formats a GitHub comment, review, or issue as a model-facing ContextMessage, marking bots and GitHub Apps because bot messages never authorize work. */

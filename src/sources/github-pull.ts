@@ -9,7 +9,8 @@ import { githubThreadId, githubThreadKey, pullNumberFromThread, sameRepository, 
 import { moveIssuesToStatus } from './github-projects.ts'
 import type { GithubConfig } from './github.ts'
 
-const PullSchema = z.looseObject({
+/** A pull request as GitHub returns it, exported so a poll can keep its last read and reuse it when GitHub answers 304. */
+export const PullSchema = z.looseObject({
   title: z.string().optional(), state: z.string(), html_url: z.string(), user: UserSchema,
   body: z.string().nullish(), created_at: z.string().optional(),
   merged: z.boolean().optional(), merged_at: z.string().nullish(), closed_at: z.string().nullish(), auto_merge: z.unknown().optional(),

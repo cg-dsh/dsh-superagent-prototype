@@ -172,6 +172,42 @@ describe('GitHub calls', () => {
     run.mockResolvedValue('{"message":"not a list"}')
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
   })
+  it('reads conditionally with the ETag of an earlier read, and takes a 304 as keeping what the caller kept', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('HTTP/2.0 200 OK\r\nEtag: W/"v1"\r\nLast-Modified: Thu, 12 Nov 2026 18:25:28 GMT\r\n\r\n{"number":12}')
+    const first = await value.apiConditional(z.looseObject({ number: z.number() }), 'issues/12')
+    if (first.notModified) throw new Error('expected the read to return a body')
+    expect(first).toMatchObject({ value: { number: 12 }, etag: 'W/"v1"', lastModified: 'Thu, 12 Nov 2026 18:25:28 GMT', more: false })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-gh', ['api', `repos/${REPOSITORY}/issues/12`, '--include'])
+    // gh exits non-zero for a 304 while printing its status line and headers, so the answer is still "not modified".
+    run.mockRejectedValueOnce(commandError({ stdout: 'HTTP/2.0 304 Not Modified\r\nEtag: W/"v1"\r\n\r\n',
+      stderr: 'gh: HTTP 304', code: 1 }))
+    expect(await value.apiConditional(z.looseObject({ number: z.number() }), 'issues/12', first)).toEqual({ notModified: true })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-gh', ['api', `repos/${REPOSITORY}/issues/12`, '--include', '-H',
+      'If-None-Match: W/"v1"'])
+    // Without an ETag, the last modification time is the validator that is sent.
+    run.mockResolvedValueOnce('HTTP/2.0 200 OK\r\nLast-Modified: Thu, 12 Nov 2026 18:25:28 GMT\r\n\r\nraw file')
+    expect(await value.textConditional('contents/README.md', { lastModified: 'Thu, 12 Nov 2026 18:25:28 GMT' }))
+      .toMatchObject({ value: 'raw file', more: false })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-gh', ['api', `repos/${REPOSITORY}/contents/README.md`, '--include', '-H',
+      'If-Modified-Since: Thu, 12 Nov 2026 18:25:28 GMT'])
+    // One page is read: a next page is reported rather than followed.
+    run.mockResolvedValueOnce('HTTP/2.0 200 OK\r\nLink: <https://api.github.com/x?page=2>; rel="next"\r\n\r\n[]')
+    expect(await value.textConditional('issues/12/comments?per_page=100')).toMatchObject({ value: '[]', more: true })
+  })
+  it('fails a conditional read on a 403 rate limit and keeps it inside the configured repository', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockRejectedValue(commandError({ stdout: 'HTTP/2.0 403 Forbidden\r\n\r\n',
+      stderr: 'gh: API rate limit exceeded (HTTP 403)', code: 1 }))
+    await expect(value.apiConditional(z.unknown(), 'issues/12')).rejects.toMatchObject({ code: 403,
+      message: 'gh: API rate limit exceeded (HTTP 403)' })
+    await expect(value.apiConditional(z.unknown(), '../other/issues')).rejects.toThrow('restricted to the configured repository')
+    expect(run).toHaveBeenCalledTimes(1)
+    const scoped = value.for('acme/other')
+    const scopedRun = vi.spyOn(scoped, 'run').mockResolvedValue('HTTP/2.0 200 OK\r\n\r\n{}')
+    await scoped.apiConditional(z.unknown(), 'issues/12')
+    expect(scopedRun).toHaveBeenLastCalledWith('/path/agent-gh', ['api', 'repos/acme/other/issues/12', '--include'])
+  })
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)

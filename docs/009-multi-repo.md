@@ -112,6 +112,21 @@ The change cursor and each Ticket's `{ at, activeAt, fingerprint }` live in KV (
 read, the repository streams, and one reconciliation per due Ticket: its pull requests, their checks and statuses, and the
 Issue it started from. With the conditional reads, an unchanged due reconciliation answers 304 and costs no rate limit.
 
+## Conditional reads: an unchanged resource costs no quota
+
+GitHub does not charge a conditional request that answers `304 Not Modified`. Each per-Ticket read keeps the validator it
+last saw and sends it back with `If-None-Match` (or `If-Modified-Since` when only a modification time was given), so a
+reconciliation that comes due by the ladder reuses the pull request, its checks and its Issue state it already had when
+nothing changed. `Commands.apiConditional` and `Commands.textConditional` parse the `--include` status line and the `ETag`
+and `Last-Modified` headers and answer either the body with its validator or "not modified"; a kept body that is missing
+or no longer validates falls back to a full read, and a 403 rate limit is still an error, so the Source pauses its ten
+minutes as before.
+
+The kept bodies live under `github-conditional:<resource>:<thread id>` (`pull`, `check-runs`, `statuses`, `issue`), so the
+primary repository's keys keep their shapes and another repository's records are named by its qualified thread id. A list
+GitHub answers with a next page is read in full and not kept, because an ETag describes only the page it came from. A
+reconciliation that answers 304 therefore costs no charged GitHub call at all; only a change costs that Ticket's reads.
+
 ## The prepare command
 
 Apply this in the Execution settings; it clones each repository on first use under a lock, then adds the Ticket's

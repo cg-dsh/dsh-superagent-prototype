@@ -1032,6 +1032,107 @@ describe('github source', () => {
     expect(claimPull(h, 't1', openPull(30))).toBe('Ticket ended because its PR was closed')
     h.store.close()
   })
+  /** GitHub answering conditional reads: each path's body and ETag, and a matching If-None-Match answers 304. */
+  function etagged(h: ReturnType<typeof host>, answers: Record<string, { value: unknown; etag?: string }>) {
+    const reads: { path: string; args: string[] }[] = []
+    const included = (value: unknown, etag?: string) =>
+      `HTTP/2.0 200 OK\r\n${etag ? `ETag: ${etag}\r\n` : ''}\r\n${JSON.stringify(value)}`
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const raw = args[1]!.replace(/^repos\/acme\/widgets\//, '')
+      const path = raw.split('?')[0]!
+      reads.push({ path, args })
+      if (path === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      const answer = answers[path] ?? (/\/(comments|reviews|statuses)$/.test(path) ? { value: [] }
+        : path.endsWith('/check-runs') ? { value: { check_runs: [] } } : undefined)
+      if (!answer) throw refused(404, 'Not Found')
+      const validator = args.includes('-H') ? args[args.indexOf('-H') + 1] : undefined
+      if (answer.etag && validator === `If-None-Match: ${answer.etag}`) {
+        throw commandError({ stdout: `HTTP/2.0 304 Not Modified\r\nETag: ${answer.etag}\r\n\r\n`,
+          stderr: 'gh: HTTP 304', code: 1 })
+      }
+      return args.includes('--include') ? included(answer.value, answer.etag)
+        : JSON.stringify(args.includes('--slurp') ? [answer.value] : answer.value)
+    })
+    return reads
+  }
+  it('asks with the ETag of an unchanged PR, checks and Issue, and reuses what it kept on a 304', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    h.store.tickets.save({ ...openTicket('t12'), channels: [githubChannel(12, 'https://github.com/acme/widgets/issues/12')] })
+    const reads = etagged(h, { 'pulls/9': { value: openPull(9), etag: '"pull-1"' },
+      'commits/abc/check-runs': { value: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] }, etag: '"runs-1"' },
+      'commits/abc/statuses': { value: [], etag: '"statuses-1"' },
+      'issues/12': { value: issue(12, { created_at: '2026-08-01T00:00:00Z' }), etag: '"issue-1"' } })
+    await pollRound(h)
+    // Each conditional read keeps its body with the validator GitHub gave it, beside the primary repository's existing keys.
+    expect(h.store.get('github-conditional:pull:9')).toMatchObject({ etag: '"pull-1"' })
+    expect(h.store.get('github-conditional:check-runs:9')).toMatchObject({ etag: '"runs-1"' })
+    expect(h.store.get('github-conditional:statuses:9')).toMatchObject({ etag: '"statuses-1"' })
+    expect(h.store.get('github-conditional:issue:12')).toMatchObject({ etag: '"issue-1"' })
+    expect(h.store.get('github-ci:9')).toMatchObject({ revision: 0 })
+    const cached = h.store.get('github-conditional:pull:9')
+    h.receive.mockClear()
+    reads.length = 0
+    await pollRound(h)
+    // Unchanged resources answer 304, and the round behaves as it did from the kept bodies: the same CI fingerprint, no Trigger.
+    expect(reads.filter(read => read.path === 'pulls/9').map(read => read.args))
+      .toEqual([expect.arrayContaining(['-H', 'If-None-Match: "pull-1"'])])
+    expect(reads.filter(read => read.path === 'commits/abc/check-runs').map(read => read.args))
+      .toEqual([expect.arrayContaining(['-H', 'If-None-Match: "runs-1"'])])
+    expect(reads.filter(read => read.path === 'issues/12').map(read => read.args))
+      .toEqual([expect.arrayContaining(['-H', 'If-None-Match: "issue-1"'])])
+    expect(h.store.get('github-conditional:pull:9')).toEqual(cached)
+    expect(h.store.get('github-ci:9')).toMatchObject({ revision: 0 })
+    expect(h.receive).not.toHaveBeenCalled()
+    h.store.close()
+  })
+  it('replaces the kept ETag and body when a resource changed', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    const answers: Record<string, { value: unknown; etag?: string }> = { 'pulls/9': { value: openPull(9), etag: '"pull-1"' },
+      'commits/abc/check-runs': { value: { check_runs: [] }, etag: '"runs-1"' } }
+    const reads = etagged(h, answers)
+    await pollRound(h)
+    // The next body and ETag replace the kept ones, and the round asks with the validator it kept before.
+    answers['pulls/9'] = { value: { ...openPull(9), auto_merge: { merge_method: 'merge' } }, etag: '"pull-2"' }
+    reads.length = 0
+    await pollRound(h)
+    expect(reads.filter(read => read.path === 'pulls/9').map(read => read.args))
+      .toEqual([expect.arrayContaining(['-H', 'If-None-Match: "pull-1"'])])
+    expect(h.store.get('github-conditional:pull:9')).toMatchObject({ etag: '"pull-2"',
+      value: expect.objectContaining({ auto_merge: { merge_method: 'merge' } }) })
+    h.store.close()
+  })
+  it('reads in full when the kept body is missing or cannot be parsed', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    h.store.set('github-conditional:pull:9', { value: { not: 'a pull request' }, etag: '"unreadable"' })
+    const reads = etagged(h, { 'pulls/9': { value: openPull(9), etag: '"pull-2"' },
+      'commits/abc/check-runs': { value: { check_runs: [] }, etag: '"runs-2"' } })
+    await pollRound(h)
+    // A kept body that no longer validates sends no validator, so the read is a full one and replaces the record.
+    expect(reads.filter(read => read.path === 'pulls/9').map(read => read.args)).toEqual([expect.not.arrayContaining(['-H'])])
+    expect(h.store.get('github-conditional:pull:9')).toMatchObject({ etag: '"pull-2"' })
+    // Missing entirely, the next round reads in full again rather than claiming a 304 without a validator.
+    h.store.delete('github-conditional:pull:9')
+    reads.length = 0
+    await pollRound(h)
+    expect(reads.filter(read => read.path === 'pulls/9').map(read => read.args)).toEqual([expect.not.arrayContaining(['-H'])])
+    h.store.close()
+  })
+  it('keeps a 403 rate limit an error, never a not-modified answer', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      if (String(args[1]).includes('notifications')) return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      throw commandError({ stdout: 'HTTP/2.0 403 Forbidden\r\n\r\n', stderr: 'gh: API rate limit exceeded (HTTP 403)', code: 1 })
+    })
+    await expect(pollRound(h)).rejects.toThrow('rate limit')
+    // The failed reconciliation records nothing, so the next round tries it again instead of waiting out a ladder.
+    expect(h.store.get('github-reconcile:t9')).toBeUndefined()
+    expect(h.store.get('github-conditional:pull:9')).toBeUndefined()
+    h.store.close()
+  })
 })
 
 describe('source context', () => {
@@ -1210,6 +1311,35 @@ describe('watching more than one GitHub repository', () => {
     expect(values({ ...github, source: 'feishu', threads: [{ source: 'feishu', id: 'oc_1:om_1' }] }).DSH_SUPERAGENT_GITHUB_REPOSITORY)
       .toBe('acme/widgets')
     expect(values().DSH_SUPERAGENT_GITHUB_REPOSITORY).toBe('acme/widgets')
+  })
+
+  it('keeps a second repository\'s conditional read under its qualified thread id', async () => {
+    const h = host({ deployment: deploymentOf() })
+    const repository = 'acme/gadgets'
+    h.store.tickets.save({ ...openTicket('t1'), follows: [{ thread: 'github:acme/gadgets#43', own: true }],
+      channels: [githubChannel(43, `https://github.com/${repository}/pull/43`, 'acme/gadgets#43')] })
+    const paths: string[] = []
+    vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!
+      paths.push(path)
+      if (path.startsWith('notifications')) return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      const included = (etag: string, value: unknown) => `HTTP/2.0 200 OK\r\nETag: ${etag}\r\n\r\n${JSON.stringify(value)}`
+      const bare = path.split('?')[0]!
+      if (bare === `repos/${repository}/pulls/43`) return included('"g1"', { ...openPull(43), html_url: `https://github.com/${repository}/pull/43` })
+      if (bare.endsWith('/check-runs')) return included('"c1"', { check_runs: [] })
+      if (bare.endsWith('/statuses')) return included('"s1"', [])
+      return JSON.stringify(args.includes('--slurp') ? [[]] : [])
+    })
+    await pollRound(h)
+    // Every conditional read stayed in the second repository, and its records are named by the qualified thread id.
+    expect(paths).toContain(`repos/${repository}/pulls/43`)
+    expect(paths.filter(path => path.includes('/pulls/43')).every(path => path.startsWith(`repos/${repository}/`))).toBe(true)
+    expect(h.store.get('github-conditional:pull:acme/gadgets#43')).toMatchObject({ etag: '"g1"' })
+    expect(h.store.get('github-conditional:check-runs:acme/gadgets#43')).toMatchObject({ etag: '"c1"' })
+    expect(h.store.get('github-conditional:statuses:acme/gadgets#43')).toMatchObject({ etag: '"s1"' })
+    // The primary repository's bare keys are untouched: nothing was written for a same-numbered thread there.
+    expect(h.store.get('github-conditional:pull:43')).toBeUndefined()
+    h.store.close()
   })
 })
 

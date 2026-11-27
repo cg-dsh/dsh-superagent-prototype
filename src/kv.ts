@@ -56,6 +56,13 @@ export const KV = {
     /** A pull request's CI baseline, by the pull request's thread id, which names its repository when it is not the primary. */
     ci: family<{ fingerprint: string; revision: number }, [thread: string]>('github-ci:'),
     requesterClosed: family<string, [ticketId: string]>('github-requester-closed:'),
+    /**
+     * What a read repeated every round last returned, by resource name and thread id (`pull`, `check-runs`, `statuses`,
+     * `issue`) together with the validator GitHub gave for it. An unchanged resource answers a conditional read with 304
+     * and costs no rate limit, so the kept body is used instead. A thread id names its repository unless it is the
+     * primary's, whose ids stay bare.
+     */
+    conditional: family<{ value: unknown; etag?: string; lastModified?: string }, [resource: string, thread: string]>('github-conditional:'),
     /** A Ticket's reconciliation ladder: when it last ran, when the Ticket was last active, and what it observed. */
     reconcile: family<ReconcileSchedule, [ticketId: string]>('github-reconcile:'),
     /** When the comment sweep last ran; the primary repository keeps the `github-thread-sweep` key. */

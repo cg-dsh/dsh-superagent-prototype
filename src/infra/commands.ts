@@ -12,23 +12,27 @@ const TIMEOUT_MS = 90_000
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
  */
 export class CliError extends Error {
-  constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
+  constructor(message: string, readonly code?: number, readonly exitCode?: number, readonly output?: string) { super(message) }
 }
 /** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
 export function commandError(error: unknown, program = 'command'): Error {
   if (error instanceof Error && error.name === 'AbortError') return error
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
+  // `gh` prints a response's status line and headers before it exits non-zero for one it treats as an error, such as
+  // HTTP 304 or 403, so the output is kept with the failure: a conditional read takes its status from there.
+  const output = error && typeof error === 'object' && 'stdout' in error && typeof error.stdout === 'string' && error.stdout
+    ? error.stdout : undefined
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
     let parsed: { error?: { code?: number; message?: string } } | undefined
     try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
-    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
+    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode, output)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
-    if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
+    if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode, output)
   }
-  return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
+  return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode, output)
 }
 function ended(error: unknown): string {
   const { killed, signal, code } = (error ?? {}) as { killed?: boolean; signal?: string | null; code?: unknown }
@@ -46,6 +50,26 @@ export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tall
   if (tally) tally.skipped += list.length - items.length
   return items
 }
+/** Splits `gh api --include` output into its HTTP status, its header block and its body; a 304 answer has no body. */
+export function included(raw: string): { status: number; headers: string; body: string } {
+  const split = raw.search(/\r?\n\r?\n/)
+  if (split < 0) throw new Error('GitHub returned no HTTP headers')
+  const headers = raw.slice(0, split)
+  const status = Number(/^HTTP\/\S+\s+(\d{3})/.exec(headers)?.[1])
+  if (!Number.isFinite(status)) throw new Error('GitHub returned no HTTP status')
+  return { status, headers, body: raw.slice(split).trim() }
+}
+/** The validators of an earlier conditional read, sent so an unchanged resource answers 304 instead of its body. */
+export interface ConditionalCache { etag?: string; lastModified?: string }
+/**
+ * What a conditional read answered: `notModified` for HTTP 304, which GitHub does not charge against the rate limit and
+ * which leaves the caller's kept body valid, or the body with the validators to keep and whether a next page exists.
+ */
+export type ConditionalRead<T> = { notModified: true }
+  | { notModified: false; value: T; etag?: string; lastModified?: string; more: boolean }
+/** A conditional read's answer before its schema is applied to the body. */
+type ConditionalAnswer = { notModified: true }
+  | { notModified: false; body: string; etag?: string; lastModified?: string; more: boolean }
 /** Rewrites Feishu error 232011 (bot not in chat) with remediation instructions. */
 function membership(error: unknown): unknown {
   if (!(error instanceof CliError) || error.code !== 232011) return error
@@ -72,11 +96,13 @@ export class Commands {
   /** The same CLI, commands and credentials, resolving every path under `repository` instead of the primary one. */
   for(repository: string): Commands { return new Commands(this.resolved, this.environment, this.signal, repository) }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
-    try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
-      return stdout
-    } catch (error) { throw commandError(error, program) }
+    try { return await this.execute(program, args, cwd) } catch (error) { throw commandError(error, program) }
+  }
+  /** Starts one CLI process and returns its stdout, leaving a non-zero exit as the raw error so a caller can read what it printed. */
+  private async execute(program: string, args: string[], cwd?: string): Promise<string> {
+    const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+    return stdout
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
   async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
@@ -91,6 +117,46 @@ export class Commands {
     if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
+  }
+  /**
+   * Calls the GitHub API on a path within the configured repository conditionally: the validator of an earlier read is
+   * sent, and an unchanged resource answers HTTP 304, which GitHub does not charge against the rate limit, so the caller
+   * keeps the body it read before. It reads one page; `more` says GitHub has a next page of the same list.
+   * @throws CliError with GitHub's HTTP status as `code` on failure, a 403 rate limit included, never `notModified`.
+   */
+  async apiConditional<T>(schema: z.ZodType<T>, path: string, cached?: ConditionalCache): Promise<ConditionalRead<T>> {
+    const answer = await this.conditional(path, cached)
+    if (answer.notModified) return answer
+    const { body, ...rest } = answer
+    return { ...rest, value: schema.parse(JSON.parse(body)) }
+  }
+  /** Reads a GitHub API path within the configured repository conditionally and returns its body as raw text, such as a file. */
+  async textConditional(path: string, cached?: ConditionalCache): Promise<ConditionalRead<string>> {
+    const answer = await this.conditional(path, cached)
+    if (answer.notModified) return answer
+    const { body, ...rest } = answer
+    return { ...rest, value: body }
+  }
+  /** Runs one conditional GET and parses its answer, accepting a 304 both as a printed status line and as gh's non-zero exit for one. */
+  private async conditional(path: string, cached?: ConditionalCache): Promise<ConditionalAnswer> {
+    const validators = cached?.etag ? ['-H', `If-None-Match: ${cached.etag}`]
+      : cached?.lastModified ? ['-H', `If-Modified-Since: ${cached.lastModified}`] : []
+    const args = ['api', this.path(path), '--include', ...validators]
+    let raw: string
+    try { raw = await this.run(this.deployment.github.cli, args) }
+    catch (error) {
+      // A 304 exits gh non-zero while it still printed its status line and headers; every other failure keeps its error.
+      let printed: ReturnType<typeof included> | undefined
+      try { if (error instanceof CliError && error.output) printed = included(error.output) } catch { /* Keep the failure itself. */ }
+      if (printed?.status === 304 || (error instanceof CliError && error.code === 304)) return { notModified: true }
+      throw error
+    }
+    const answer = included(raw)
+    if (answer.status === 304) return { notModified: true }
+    const etag = /^etag:\s*(.+)$/im.exec(answer.headers)?.[1]?.trim()
+    const lastModified = /^last-modified:\s*(.+)$/im.exec(answer.headers)?.[1]?.trim()
+    return { notModified: false, body: answer.body, ...etag ? { etag } : {}, ...lastModified ? { lastModified } : {},
+      more: /rel="next"/i.test(answer.headers) }
   }
   /** Fetches all pages of a GitHub API list within the configured repository, skipping items that fail schema validation. */
   async pages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
