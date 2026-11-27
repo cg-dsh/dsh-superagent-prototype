@@ -942,6 +942,68 @@ describe('github source', () => {
     expect(h.store.get('github-since')).toBe('2026-09-08T00:00:00.000Z')
     h.store.close()
   })
+  it('reconciles an idle Ticket only as often as its ladder earns, and at once after local activity', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    const reads = github(h, { notifications: [], 'pulls/9': openPull(9), 'commits/abc/check-runs': { check_runs: [] } })
+    // First sight: the Ticket has no schedule, so this round reconciles it.
+    await pollRound(h)
+    expect(bare(reads)).toContain('pulls/9')
+    // The PR's checks fingerprint keeps its existing key, and the schedule is the only new record.
+    expect(h.store.get('github-ci:9')).toMatchObject({ revision: 0 })
+    const schedule = h.store.get<Record<string, unknown>>('github-reconcile:t9')!
+    expect(schedule).toMatchObject({ at: expect.any(String), activeAt: expect.any(String) })
+    // Idle for two hours (a 15-minute interval) and reconciled ten minutes ago: not yet owed.
+    const past = (ms: number) => new Date(Date.now() - ms).toISOString()
+    h.store.set('github-reconcile:t9', { ...schedule, at: past(10 * 60_000), activeAt: past(2 * 3600_000) })
+    reads.length = 0
+    await pollRound(h)
+    expect(bare(reads)).not.toContain('pulls/9')
+    // Twenty minutes after that same reconciliation, the interval has passed and it runs again.
+    h.store.set('github-reconcile:t9', { ...schedule, at: past(20 * 60_000), activeAt: past(2 * 3600_000) })
+    await pollRound(h)
+    expect(bare(reads)).toContain('pulls/9')
+    // Activity from the local change feed resets the ladder: a Ticket just updated is reconciled on the next round.
+    h.store.set('github-reconcile:t9', { ...h.store.get<Record<string, unknown>>('github-reconcile:t9')!,
+      at: past(10 * 60_000), activeAt: past(2 * 3600_000) })
+    h.store.tickets.save({ ...h.store.tickets.get('t9')!, updatedAt: new Date(Date.now() + 1000).toISOString() })
+    reads.length = 0
+    await pollRound(h)
+    expect(bare(reads)).toContain('pulls/9')
+    h.store.close()
+  })
+  it('leaves an idle Ticket\'s Issue state unread until its ladder comes round again', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t12'), channels: [githubChannel(12, 'https://github.com/acme/widgets/issues/12')] })
+    const reads = github(h, { notifications: [], 'issues/12': issue(12, { created_at: '2026-08-01T00:00:00Z' }) })
+    await pollRound(h)
+    expect(bare(reads)).toContain('issues/12')
+    // Five hours idle earns a 30-minute interval, so ten minutes after the last run is not owed.
+    const schedule = h.store.get<Record<string, unknown>>('github-reconcile:t12')!
+    const past = (ms: number) => new Date(Date.now() - ms).toISOString()
+    h.store.set('github-reconcile:t12', { ...schedule, at: past(10 * 60_000), activeAt: past(5 * 3600_000) })
+    reads.length = 0
+    await pollRound(h)
+    expect(bare(reads)).not.toContain('issues/12')
+    // Half an hour later it is.
+    h.store.set('github-reconcile:t12', { ...schedule, at: past(31 * 60_000), activeAt: past(5 * 3600_000) })
+    await pollRound(h)
+    expect(bare(reads)).toContain('issues/12')
+    h.store.close()
+  })
+  it('retries a Ticket whose reconciliation read failed on the next round, rather than waiting out the ladder', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
+    github(h, { notifications: [], 'pulls/9': refused(502, 'Bad Gateway') })
+    await expect(pollRound(h)).rejects.toThrow('502')
+    // A failed read does not record a reconciliation, so the Ticket is still due.
+    expect(h.store.get('github-reconcile:t9')).toBeUndefined()
+    const reads = github(h, { notifications: [], 'pulls/9': openPull(9), 'commits/abc/check-runs': { check_runs: [] } })
+    await pollRound(h)
+    expect(bare(reads)).toContain('pulls/9')
+    expect(h.store.get('github-reconcile:t9')).toBeDefined()
+    h.store.close()
+  })
   it('lets a ticket follow its source PR or the agent\'s PR from its branch, and refuses others', async () => {
     const h = host()
     const source = commentTrigger({ id: 1, body: '@agent-bot fix', user: { login: 'alice' },
@@ -986,7 +1048,10 @@ describe('source context', () => {
     h.store.tickets.save({ ...openTicket('second'), updatedAt: '2026-11-14T10:00:01.000Z' })
     // The limit is clamped to at least one, and to at most 500.
     expect(h.tickets.changed(after, 0).items).toHaveLength(1)
-    for (let n = 0; n < 501; n++) h.store.tickets.save({ ...openTicket(`bulk-${String(n).padStart(3, '0')}`), updatedAt: '2026-11-14T11:00:00.000Z' })
+    h.store.atomic(() => {
+      for (let n = 0; n < 501; n++) h.store.tickets.save({ ...openTicket(`bulk-${String(n).padStart(3, '0')}`),
+        updatedAt: '2026-11-14T11:00:00.000Z' })
+    })
     expect(h.tickets.changed(after, 9999).items).toHaveLength(500)
     h.store.close()
   })

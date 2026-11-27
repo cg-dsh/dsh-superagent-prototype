@@ -1,6 +1,6 @@
 /** GitHub source kind definition, notification and repository polling loops, and Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
-import { key, type Thread, type Trigger } from '../core/index.ts'
+import { key, type Thread, type Ticket, type Trigger } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
@@ -9,10 +9,11 @@ import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddres
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
-import { observePull, pullRefsOf, pullsOf, readPull, type Pull } from './github-pull.ts'
+import { observePull, pullRefsOf, pullsOf, readPull, ticketRepository, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, eachLimit, pause, POLL_CONCURRENCY, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
+import { noteActivity, noteReconciliation, reconciliationDue, scheduleOf } from './github-reconcile.ts'
 import { branchCiThreadId, githubThreadId, githubThreadKey, sameRepository, threadNumber, threadRepository, threadRepositoryOf } from './github-thread.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
@@ -170,11 +171,22 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 interface Round {
   started: string; signal?: AbortSignal | undefined
   /** Pull requests read in this round, by thread id, so a number in one repository is not another's. */
-  pulls: Map<string, Promise<Pull>>; read: Set<string>; failures: string[]; dropped: string[]; abandoned: string[]
+  pulls: Map<string, Promise<Pull>>
+  /** CI fingerprints read in this round, by thread id, so two Tickets following one pull request read its checks once. */
+  checks: Map<string, Promise<string>>
+  read: Set<string>; failures: string[]; dropped: string[]; abandoned: string[]
+  /** Tickets this round owes a reconciliation, frozen before its reads so activity found later adds none to this round. */
+  due?: Set<string>
+  /** What this round's reconciliation reads observed for each Ticket, by ticket id, written once the round finishes. */
+  observed: Map<string, { pulls: string[]; issue: string[] }>
+  /** Tickets whose reconciliation read failed, so their schedule does not advance and the next round retries them. */
+  retry: Set<string>
   tally: Tally
 }
-const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
-  failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
+/** How many Ticket changes one round reads from the local change feed, which costs no GitHub call. */
+const TICKET_CHANGES_PER_ROUND = 200
+const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), checks: new Map(),
+  read: new Set(), observed: new Map(), retry: new Set(), failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 /** The primary repository, whose thread ids stay bare and whose keys keep their old form. */
 const primaryOf = (ctx: SourceContext): string => ctx.deployment.repository
@@ -191,6 +203,45 @@ const threadRefRepository = (ctx: SourceContext, id: string): string => threadRe
 const threadRefId = (ctx: SourceContext, id: string): string => id.startsWith('ci:') ? id : refThreadId(ctx, id)
 /** Where a failure happened, so two repositories' streams are told apart; empty for the primary repository. */
 const where = (ctx: SourceContext): string => sameRepository(ctx.repository, primaryOf(ctx)) ? '' : `${ctx.repository}: `
+/** The Tickets this round owes a reconciliation: the frozen due set, or the ladder when a step is called on its own. */
+function dueTickets(ctx: SourceContext, round: Round): Ticket[] {
+  const now = Date.parse(round.started)
+  return ctx.tickets.open().filter(ticket => round.due
+    ? round.due.has(ticket.id)
+    : reconciliationDue(scheduleOf(ctx, ticket.id), now))
+}
+/** What this round's reconciliation reads observed for a Ticket, created on its first successful read. */
+function observed(round: Round, ticketId: string): { pulls: string[]; issue: string[] } {
+  let seen = round.observed.get(ticketId)
+  if (!seen) { seen = { pulls: [], issue: [] }; round.observed.set(ticketId, seen) }
+  return seen
+}
+/**
+ * Marks the Tickets the local change feed reports as active, which resets their ladder to the top bucket, and freezes what
+ * this round owes. The feed costs no GitHub read, and freezing before the round's reads keeps activity found later from
+ * adding a read of its own to this round.
+ */
+function planReconciliations(ctx: SourceContext, round: Round): void {
+  const cursor = ctx.state.get(KV.github.changes)
+  // The first round starts the feed now: Tickets already open have no schedule and are reconciled as first sightings.
+  if (!cursor) ctx.state.set(KV.github.changes, { at: round.started, id: '' })
+  else {
+    const changes = ctx.tickets.changed(cursor, TICKET_CHANGES_PER_ROUND)
+    ctx.state.set(KV.github.changes, changes.next)
+    // A changed Ticket is reconciled this round, which is what a Ticket someone is waiting on needs; others follow the ladder.
+    for (const { ticket } of changes.items) noteActivity(ctx, ticket.id, round.started)
+  }
+  const now = Date.parse(round.started)
+  round.due = new Set(ctx.tickets.open().filter(ticket => reconciliationDue(scheduleOf(ctx, ticket.id), now)).map(ticket => ticket.id))
+}
+/** Writes what the round's reconciliation reads observed, unless a read failed: a failed Ticket stays due for the next round. */
+function settleReconciliations(ctx: SourceContext, round: Round): void {
+  if (stopped(ctx, round)) return
+  for (const [ticketId, seen] of round.observed) {
+    if (round.retry.has(ticketId)) continue
+    noteReconciliation(ctx, ticketId, { pulls: JSON.stringify([...seen.pulls].sort()), issue: JSON.stringify([...seen.issue].sort()) }, round.started)
+  }
+}
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 /** Slack added to every notified read:
  * GitHub indexes a notification seconds to a minute after the comment it is for,
@@ -334,6 +385,8 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
+  // The local change feed and the ladder decide what this round owes each Ticket before any GitHub read of it.
+  planReconciliations(ctx, round)
   const began = Date.now()
   // Where a round spends its time decides the detection latency, so each step is timed and reported.
   let mark = Date.now()
@@ -350,6 +403,7 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   lap('pulls')
   for (const scoped of scopes) await pollRequesterClosed(scoped, round)
   lap('closed')
+  settleReconciliations(ctx, round)
   for (const scoped of scopes) await pollThreads(scoped, signal, round)
   lap('threads')
   if ('error' in notified) throw notified.error
@@ -496,7 +550,8 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
 async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
   const repository = primaryOf(ctx)
-  await eachLimit(ctx.tickets.open(), POLL_CONCURRENCY, async ticket => {
+  const tickets = dueTickets(ctx, round).filter(ticket => sameRepository(ticketRepository(ticket, repository), ctx.repository))
+  await eachLimit(tickets, POLL_CONCURRENCY, async ticket => {
     if (stopped(ctx, round)) return
     for (const channel of ticket.channels ?? []) {
       if (channel.source !== SOURCE) continue
@@ -511,11 +566,14 @@ async function pollRequesterClosed(ctx: SourceContext, round: Round): Promise<vo
       try {
         issue = await commands.api(IssueSchema, `issues/${number}`)
       } catch (error) {
+        round.retry.add(ticket.id)
         if (!stopped(ctx, round)) failed(ctx, round, channelThread, error)
         continue
       }
+      const closedAt = (issue as { closed_at?: string | null }).closed_at
+      observed(round, ticket.id).issue.push(`issue:${threadIdOf(ctx, number)}:${issue.state}:${closedAt ?? ''}`)
       if (issue.state !== 'closed') continue
-      const at = (issue as { closed_at?: string | null }).closed_at ?? new Date().toISOString()
+      const at = closedAt ?? new Date().toISOString()
       if (ctx.state.get(KV.github.requesterClosed(ticket.id)) === at) continue
       ctx.state.set(KV.github.requesterClosed(ticket.id), at)
       const open = pullsOf(ticket, true)
@@ -540,29 +598,51 @@ function closedIssueTrigger(issue: z.infer<typeof IssueSchema>, number: number, 
 
 export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   // Each follow thread names its repository; this scoped step reads only the pull requests of its own.
-  const numbers = new Map<string, number>()
-  for (const ref of ctx.tickets.open().flatMap(ticket => pullRefsOf(ticket, primaryOf(ctx), true))) {
-    if (sameRepository(ref.repository, ctx.repository)) numbers.set(threadIdOf(ctx, ref.number), ref.number)
-  }
+  const repository = primaryOf(ctx)
+  const work = dueTickets(ctx, round).flatMap(ticket => pullRefsOf(ticket, repository, true)
+    .filter(ref => sameRepository(ref.repository, ctx.repository))
+    .map(ref => ({ ticket, thread: threadIdOf(ctx, ref.number), number: ref.number })))
+  // A pull request several Tickets follow is read once; each Ticket still records what it saw.
+  const numbers = new Map(work.map(item => [item.thread, item.number]))
+  const seen = new Map<string, string>()
   await eachLimit([...numbers.values()], POLL_CONCURRENCY, async number => {
     if (stopped(ctx, round)) return
+    const thread = threadIdOf(ctx, number)
     try {
       const pr = await pull(ctx, round, number)
-      if (pr.state !== 'closed' && !pr.merged) await pollChecks(ctx, round, number, pr)
-    } catch (error) { if (!stopped(ctx, round)) failed(ctx, round, threadIdOf(ctx, number), error) }
+      const checks = pr.state !== 'closed' && !pr.merged ? await pullChecksOnce(ctx, round, number, pr) : ''
+      seen.set(thread, `pr:${thread}:${pr.state}:${pr.merged ? 'merged' : 'open'}:${pr.head.sha}:${checks}`)
+    } catch (error) {
+      if (!stopped(ctx, round)) failed(ctx, round, thread, error)
+      seen.set(thread, '')
+    }
   })
+  for (const item of work) {
+    const observation = seen.get(item.thread)
+    // A pull request this round could not read keeps its Ticket due, so the next round retries it rather than waiting out the ladder.
+    if (!observation) round.retry.add(item.ticket.id)
+    else observed(round, item.ticket.id).pulls.push(observation)
+  }
 }
-/** Polls a PR's CI checks; only changes after the first baseline observation become Triggers. */
-async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<void> {
+/** Polls a PR's CI checks at most once per round, however many Tickets follow that pull request. */
+function pullChecksOnce(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<string> {
+  const thread = threadIdOf(ctx, number)
+  let read = round.checks.get(thread)
+  if (!read) { read = pollChecks(ctx, round, number, pr); round.checks.set(thread, read) }
+  return read
+}
+/** Reads a PR's CI checks and answers their fingerprint; a change after the first look is a Trigger. */
+async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: Pull): Promise<string> {
   const snapshot = await pullChecks(ctx.commands.withSignal(round.signal), pr.head.sha, round.tally)
   const fingerprint = key(JSON.stringify(snapshot))
   const thread = threadIdOf(ctx, number)
   const previous = ctx.state.get(KV.github.ci(thread))
-  if (previous?.fingerprint === fingerprint) return
+  if (previous?.fingerprint === fingerprint) return fingerprint
   const revision = previous ? previous.revision + 1 : 0
   if (previous) await ctx.receive(ciTrigger(pr, revision, ciSummary(snapshot, `PR #${number}`, `github/pulls/${number}/checks`), thread))
   ctx.state.set(KV.github.ci(thread), { fingerprint, revision })
   ctx.threads.describe(githubThreadKey(ctx.repository, number, primaryOf(ctx)), { facts: { ci: ciFact(ciCounts(snapshot)) } })
+  return fingerprint
 }
 function nameThread(ctx: SourceContext, number: number, title: string): void {
   const thread = githubThreadKey(ctx.repository, number, primaryOf(ctx))

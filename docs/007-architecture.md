@@ -192,7 +192,7 @@ Generic code accesses Source behavior through the registry. `send(message, comma
 
 Plugins receive `SourceHost`: the registry and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`.
 
-That context supplies deployment and commands, setup readiness (`ready`, `configured`, `problem`), configuration, `receive`, `atomic`, and typed `state`. It also exposes Thread reads and metadata writes, Ticket reads and binding/closure commands, Trigger reads, `notify` through Outbox, and `report` for declared health entries.
+That context supplies deployment and commands, setup readiness (`ready`, `configured`, `problem`), configuration, `receive`, `atomic`, and typed `state`. It also exposes Thread reads and metadata writes, Ticket reads (including `changed(after, limit)`, the Tickets changed since a cursor with their stage, so a Source follows Ticket transitions without reading every Ticket) and binding/closure commands, Trigger reads, `notify` through Outbox, and `report` for declared health entries.
 
 ### DshExecutor
 
@@ -296,7 +296,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
-| `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, including the per-repository GitHub cursors and CI baselines, and the `Key` and `Family` types the Store and `SourceContext.state` take |
+| `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, including the per-repository GitHub cursors and CI baselines, each GitHub Ticket's reconciliation schedule and the Ticket change cursor, and the `Key` and `Family` types the Store and `SourceContext.state` take |
 | `src/navigation.ts` | Opens a DeepSeek Harness Session from the panel once the host's catalog lists it |
 | `src/core/model.ts` | The domain types, among them the typed Ticket and `MandateBasis`, with `threadKey`, `ticketOutcome`, `reached`, `followupOwners`, `settled`, `waitsForPerson`, `liveTicket`, `runningAssignment`, `latestAssignment` and `latestReport` |
 | `src/core/ports.ts` | The ports: `Repositories`, `Policy`, `SourceScope`, `Assessor`, `Executor`, `Outbox`, and the domain events |
@@ -319,7 +319,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
 | `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
-| `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
+| `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write; `changedTickets` lists the Tickets updated after a `(updatedAt, id)` cursor for a Source's change feed |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
@@ -335,7 +335,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers; its thread and repository reads are scoped to the candidate's own thread repository |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
-| `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext`, and `scope(repository)` for the context of another repository, carrying the commands the factory gave it |
+| `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext`, and `scope(repository)` for the context of another repository, carrying the commands the factory gave it; `tickets.changed` reads the change feed with each Ticket's stage, its limit clamped to 1-500 |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role; a worker's `github/…` originals read the repository of its own Ticket |
@@ -360,9 +360,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/registry.ts` | `SourceRegistry` |
-| `src/sources/host.ts` | `SourceHost`, `SourceContext` with its optional `scope(repository)`, `Health`, `health` and the fixed health texts |
+| `src/sources/host.ts` | `SourceHost`, `SourceContext` with its optional `scope(repository)` and its Tickets' `changed(after, limit)` feed (`TicketCursor`, `TicketChange`), `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
-| `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: one poll round that reads the account's notifications once and then runs every repository-scoped step — streams, default-branch CI, the pull requests of open Tickets with their CI, the comment sweep and subscribed Threads — per watched repository |
+| `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: one poll round that reads the account's notifications once and then runs every repository-scoped step — streams, default-branch CI, the pull requests and Issue states of open Tickets with their CI, the comment sweep and subscribed Threads — per watched repository; each Ticket's reconciliation follows its own idle ladder, driven by the local Ticket change feed |
+| `src/sources/github-reconcile.ts` | `reconcileInterval`, the idle ladder from every round (under five minutes idle) to hourly (over twelve), and a Ticket's reconciliation schedule in KV: when it last ran, when its Ticket was last active, and the fingerprint of what it observed, so an idle Ticket costs no GitHub read until it is due |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, addressed by thread id so another repository's threads are qualified, and GitHub addresses |
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), each in its own repository's thread, the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/app/cleanup.ts` | The cleanup command a Ticket's end runs once, so finished workspaces do not accumulate |
@@ -415,7 +416,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/projects.spec.ts` | The project column a merged PR moves to: matching a hint against the columns a project offers, and never choosing a finished one |
 | `tests/github-thread.spec.ts` | Thread ids across repositories, and the bare form the primary repository keeps |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
-| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health, and watching several repositories in one round |
+| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health, watching several repositories in one round, and the per-Ticket reconciliation ladder |
+| `tests/github-reconcile.spec.ts` | The reconciliation ladder, bucket by bucket with its boundaries and cap, when a Ticket's reconciliation is due, and the schedule record that activity and a changed observation reset |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
@@ -439,7 +441,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
 | `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
-| `tests/store.spec.ts` | Repositories and their working sets, in SQLite as in memory, the kv area, with every key of `KV` spelled only in `src/kv.ts` and the migration, settings history and queries |
+| `tests/store.spec.ts` | Repositories and their working sets, in SQLite as in memory, the kv area, with every key of `KV` spelled only in `src/kv.ts` and the migration, settings history and queries, and the Ticket change feed in `(updatedAt, id)` order |
 | `tests/prompts.spec.ts` | Prompt validation, assembly and versions |
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
@@ -482,7 +484,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Prompt versions | `prompt-revision`, `prompt-version:<n>` |
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
-| Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
+| Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; each GitHub Ticket's reconciliation schedule (`github-reconcile:<ticket id>`) and the Ticket change cursor (`github-changes`); keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 
 Dismissal is stored on its Decision. Input text is rendered from the Ticket when read, so neither needs a separate key-value record.

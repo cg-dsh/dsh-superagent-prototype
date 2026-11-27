@@ -35,6 +35,8 @@ Decision: **one GitHub source, several repositories** (option B), because the ag
   (`githubThreadContext`, `admissionContext`), a worker's `github/…` originals, pull-request reads and claims, and branch
   and CI checks all scope their commands to `threadRepository(thread, primary)`. A qualified id never falls back to the
   primary, where it would otherwise load the same-numbered Issue or PR of another repository.
+- **Per-Ticket reconciliation follows an idle ladder**, described below: notifications still poll every round, while a
+  Ticket's pull requests, checks and Issue state are read only when the interval its own idle time earns has passed.
 
 ## The layer beneath: every read is scoped to one repository
 
@@ -82,6 +84,33 @@ independent view of what it owes.
 | notification reads | `notification.repository.full_name` |
 | Ticket pull requests | the thread ids on the Ticket's `follows` |
 | the Execution environment | the Ticket's originating thread |
+
+## Per-Ticket reconciliation: the ladder
+
+Notifications stay the fast path: they are read every round. The reconciliation behind them — a Ticket's pull requests
+with their CI, and the Issue state that can withdraw it — follows an idle ladder instead of the poll interval, so a Ticket
+being worked on is reconciled every round and one left hanging costs no GitHub read until it is due.
+
+| Idle since the Ticket's last activity | Reconcile every |
+|---|---|
+| up to 5 min | round (the configured `pollSeconds`, 60 s) |
+| 5-15 min | 2 min |
+| 15-60 min | 5 min |
+| 1-4 h | 15 min |
+| 4-12 h | 30 min |
+| over 12 h | 60 min (cap) |
+
+`reconcileInterval(idleMs)` in `src/sources/github-reconcile.ts` is that table, pure and unit-tested; each bucket begins at
+its `>=` boundary, so exactly five minutes idle already earns the 2-minute interval. A Ticket with no schedule reconciles
+on first sight. Activity resets the ladder to the top bucket: every Ticket the local change feed reports
+(`SourceContext.tickets.changed`, a SQLite read with no GitHub call) and every reconciliation that observes a change (PR
+state, head sha, checks fingerprint or Issue state). Activity only stamps the Ticket; it never adds a read of its own, and
+the due set is frozen before a round's reads. A failed reconciliation does not record its run, so the next round retries it.
+
+The change cursor and each Ticket's `{ at, activeAt, fingerprint }` live in KV (`github-changes`,
+`github-reconcile:<ticket id>`), and no existing key changes shape. A round's GitHub reads are therefore the notifications
+read, the repository streams, and one reconciliation per due Ticket: its pull requests, their checks and statuses, and the
+Issue it started from. With the conditional reads, an unchanged due reconciliation answers 304 and costs no rate limit.
 
 ## The prepare command
 

@@ -6,6 +6,8 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
+import type { ReconcileSchedule } from './sources/github-reconcile.ts'
+import type { TicketCursor } from './sources/host.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -44,6 +46,8 @@ export const KV = {
    * counts reported CI changes so each produces a distinct Trigger ID).
    */
   github: { since: record<string>('github-since'), retries: record<Record<string, Retry>>('github-retry'),
+    /** Position in the local Ticket change feed; reading it costs no GitHub call. */
+    changes: record<TicketCursor>('github-changes'),
     cursor: family<string, [thread: string]>('github-cursor:'),
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
     /** The default branch's CI baseline; the primary repository's key stays `github-branch-ci`. */
@@ -52,6 +56,8 @@ export const KV = {
     /** A pull request's CI baseline, by the pull request's thread id, which names its repository when it is not the primary. */
     ci: family<{ fingerprint: string; revision: number }, [thread: string]>('github-ci:'),
     requesterClosed: family<string, [ticketId: string]>('github-requester-closed:'),
+    /** A Ticket's reconciliation ladder: when it last ran, when the Ticket was last active, and what it observed. */
+    reconcile: family<ReconcileSchedule, [ticketId: string]>('github-reconcile:'),
     /** When the comment sweep last ran; the primary repository keeps the `github-thread-sweep` key. */
     threadSweep: family<string, [repository: string, primary: string]>('github-thread-sweep',
       (repository, primary) => repository.trim().toLowerCase() === primary.trim().toLowerCase() ? '' : `:${repository}`) },
